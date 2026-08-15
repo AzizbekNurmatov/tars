@@ -13,6 +13,9 @@ DEFAULT_MODEL = "base"
 DEFAULT_DEVICE = "cpu"
 DEFAULT_COMPUTE_TYPE = "int8"
 
+# Module-level singleton used by the simple ``transcribe_audio`` helper.
+_default_transcriber: Transcriber | None = None
+
 
 class Transcriber:
     """Lazy-load a Whisper model and transcribe WAV files."""
@@ -30,7 +33,10 @@ class Transcriber:
 
     def _ensure_model(self) -> WhisperModel:
         if self._model is None:
-            ui.info(f"Loading Whisper model '{self.model_size}' ({self.device}/{self.compute_type})…")
+            ui.info(
+                f"Loading Whisper model '{self.model_size}' "
+                f"({self.device}/{self.compute_type})…"
+            )
             self._model = WhisperModel(
                 self.model_size,
                 device=self.device,
@@ -42,10 +48,25 @@ class Transcriber:
         """Load model weights up front so the first utterance is faster."""
         self._ensure_model()
 
-    def transcribe(self, wav_path: Path) -> str:
+    def transcribe(self, wav_path: Path | str) -> str:
         ui.transcribing()
         model = self._ensure_model()
         segments, _info = model.transcribe(str(wav_path), beam_size=1, vad_filter=True)
         text = " ".join(segment.text.strip() for segment in segments).strip()
-        ui.transcript(text or "(empty)")
+        ui.heard(text or "(empty)")
         return text
+
+
+def transcribe_audio(file_path: str) -> str:
+    """Process a WAV file and return clean transcribed text.
+
+    Uses a shared local Whisper ``base`` model on CPU (int8).
+    """
+    global _default_transcriber
+    if _default_transcriber is None:
+        _default_transcriber = Transcriber(
+            model_size=DEFAULT_MODEL,
+            device=DEFAULT_DEVICE,
+            compute_type=DEFAULT_COMPUTE_TYPE,
+        )
+    return _default_transcriber.transcribe(file_path)

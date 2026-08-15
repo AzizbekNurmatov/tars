@@ -1,4 +1,8 @@
-"""Thread-safe microphone capture via sounddevice."""
+"""Thread-safe push-to-talk microphone capture via sounddevice + numpy.
+
+Hotkey press/release is handled by ``tars.hotkey``; this module only owns
+the audio buffer and WAV write (scipy.io.wavfile).
+"""
 
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ class AudioRecorder:
 
     The sounddevice InputStream callback runs on a PortAudio thread; all
     shared state is guarded by ``_lock`` so the pynput listener thread and
-    the main worker never race.
+    the worker never race.
     """
 
     def __init__(self, sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS) -> None:
@@ -62,7 +66,7 @@ class AudioRecorder:
                 callback=self._callback,
             )
             self._stream.start()
-            ui.listening()
+            ui.recording()
         except Exception as exc:  # noqa: BLE001
             with self._lock:
                 self._recording = False
@@ -97,7 +101,7 @@ class AudioRecorder:
             ui.error("Audio buffer is silent / empty.")
             return None
 
-        # float32 [-1, 1] → int16 PCM for broad Whisper compatibility
+        # float32 [-1, 1] → int16 PCM for Whisper compatibility
         pcm = np.clip(audio, -1.0, 1.0)
         pcm_i16 = (pcm * 32767.0).astype(np.int16)
 

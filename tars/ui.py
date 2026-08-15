@@ -10,7 +10,12 @@ def status(label: str, detail: str = "") -> None:
 
 
 def listening() -> None:
-    status("🔴 [LISTENING]", "Hold Ctrl+Space and speak…")
+    """Alias kept for older call sites."""
+    recording()
+
+
+def recording() -> None:
+    status("🔴 [RECORDING]", "Hold Ctrl+Space and speak…")
 
 
 def processing() -> None:
@@ -31,7 +36,7 @@ def executing(tool_name: str) -> None:
 
 def idle() -> None:
     """Voice-mode idle (push-to-talk)."""
-    status("⚪ [IDLE]", "Release done. Waiting for next Ctrl+Space…")
+    status("⚪ [IDLE]", "Waiting for next Ctrl+Space…")
 
 
 def idle_cli() -> None:
@@ -48,7 +53,11 @@ def error(message: str) -> None:
 
 
 def transcript(text: str) -> None:
-    print(f"\n📝 [TRANSCRIPT]\n   \"{text}\"", flush=True)
+    heard(text)
+
+
+def heard(text: str) -> None:
+    print(f'\n🗣️ [HEARD: "{text}"]', flush=True)
 
 
 def llm_message(text: str) -> None:

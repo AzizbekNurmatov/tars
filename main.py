@@ -1,32 +1,26 @@
-"""TARS entrypoint — text CLI now; push-to-talk hooks preserved for later.
+"""TARS entrypoint — CLI text loop or voice push-to-talk.
 
-Current mode: type commands at the "Enter command: " prompt.
-Voice / hotkey / Whisper modules remain intact under ``tars/`` and can be
-re-enabled via ``run_push_to_talk()`` when you are ready.
+Both modes feed the same pipeline: text → ``llm.handle(text)`` → tools.
+Switch with ``TARS_MODE=cli`` or ``TARS_MODE=voice`` in ``.env``.
 """
 
 from __future__ import annotations
 
 import os
+import queue
 import sys
+import threading
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-from tars.llm import LLMOrchestrator
 from tars import ui
+from tars.audio import AudioRecorder
+from tars.hotkey import HotkeyListener
+from tars.llm import LLMOrchestrator
+from tars.transcribe import Transcriber
 
-# ---------------------------------------------------------------------------
-# Voice / push-to-talk imports — kept available so the audio loop can be
-# plugged back in without reshaping the project. Unused in CLI mode.
-# ---------------------------------------------------------------------------
-# from pathlib import Path
-# import queue
-# import threading
-# from tars.audio import AudioRecorder
-# from tars.hotkey import HotkeyListener
-# from tars.transcribe import Transcriber
-#
-# TEMP_WAV = Path(os.environ.get("TEMP", os.environ.get("TMP", "."))) / "temp_audio.wav"
+TEMP_WAV = Path(os.environ.get("TEMP", os.environ.get("TMP", "."))) / "temp_audio.wav"
 
 
 def _require_llm_config() -> str | None:
@@ -43,7 +37,7 @@ def _require_llm_config() -> str | None:
 
 
 def run_cli(llm: LLMOrchestrator) -> int:
-    """Text-based command loop (active mode for this iteration)."""
+    """Text-based command loop."""
     print("=" * 60)
     print("  TARS — Desktop Automation Assistant (CLI mode)")
     print("  Type a command, or 'quit' / 'exit' to leave")
@@ -76,91 +70,88 @@ def run_cli(llm: LLMOrchestrator) -> int:
 
 
 def run_push_to_talk(llm: LLMOrchestrator) -> int:
-    """Push-to-talk loop (Ctrl+Space → record → Whisper → LLM).
+    """Push-to-talk loop: Ctrl+Space → record → Whisper → ``llm.handle(text)``."""
+    recorder = AudioRecorder()
+    transcriber = Transcriber(model_size=os.getenv("WHISPER_MODEL", "base"))
 
-    Intentionally stubbed for this iteration so the CLI can be tested without
-    mic / hotkey / Whisper deps. Uncomment the body and the voice imports at
-    the top of this file when you are ready to re-enable voice.
-    """
-    _ = llm  # reserved for the shared orchestration layer
-    ui.error(
-        "Push-to-talk is parked for this iteration. "
-        "Use CLI mode, or uncomment the voice pipeline in main.run_push_to_talk()."
-    )
-    # ------------------------------------------------------------------
-    # FUTURE: restore the full PTT pipeline (kept as a drop-in reference)
-    # ------------------------------------------------------------------
-    # recorder = AudioRecorder()
-    # transcriber = Transcriber(model_size=os.getenv("WHISPER_MODEL", "base"))
-    #
-    # jobs: queue.Queue[Path | None] = queue.Queue()
-    # stop_event = threading.Event()
-    #
-    # def worker() -> None:
-    #     while not stop_event.is_set():
-    #         try:
-    #             wav_path = jobs.get(timeout=0.25)
-    #         except queue.Empty:
-    #             continue
-    #         if wav_path is None:
-    #             jobs.task_done()
-    #             break
-    #         try:
-    #             text = transcriber.transcribe(wav_path)
-    #             if text:
-    #                 llm.handle(text)  # same parser / tool path as CLI
-    #             else:
-    #                 ui.error("Nothing transcribed — try speaking closer to the mic.")
-    #         except Exception as exc:  # noqa: BLE001
-    #             ui.error(f"Pipeline failed: {exc}")
-    #         finally:
-    #             ui.idle()
-    #             jobs.task_done()
-    #
-    # worker_thread = threading.Thread(target=worker, name="tars-worker", daemon=True)
-    # worker_thread.start()
-    #
-    # try:
-    #     ui.info("Warming up Whisper (first load may download the model)…")
-    #     transcriber.warmup()
-    #     ui.info("Whisper ready.")
-    # except Exception as exc:  # noqa: BLE001
-    #     ui.error(f"Whisper failed to load: {exc}")
-    #     return 1
-    #
-    # def on_press() -> None:
-    #     if recorder.is_recording:
-    #         return
-    #     recorder.start()
-    #
-    # def on_release() -> None:
-    #     wav = recorder.stop_and_save(TEMP_WAV)
-    #     if wav is not None:
-    #         jobs.put(wav)
-    #
-    # listener = HotkeyListener(on_press=on_press, on_release=on_release)
-    # print("=" * 60)
-    # print("  TARS — Push-to-Talk Desktop Assistant")
-    # print("  Hold  Ctrl+Space  to record · release to run")
-    # print("  Press  Ctrl+C  to quit")
-    # print("=" * 60)
-    # ui.idle()
-    # listener.start()
-    # try:
-    #     while True:
-    #         listener.join()
-    #         break
-    # except KeyboardInterrupt:
-    #     print("\nShutting down…", flush=True)
-    # finally:
-    #     stop_event.set()
-    #     jobs.put(None)
-    #     listener.stop()
-    #     if recorder.is_recording:
-    #         recorder.stop_and_save(TEMP_WAV)
-    #     worker_thread.join(timeout=5)
-    # return 0
-    return 1
+    # Hotkey thread only enqueues paths; worker does STT + LLM (never blocks pynput).
+    jobs: queue.Queue[Path | None] = queue.Queue()
+    stop_event = threading.Event()
+    busy = threading.Event()  # ignore overlapping utterances while processing
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                wav_path = jobs.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if wav_path is None:
+                jobs.task_done()
+                break
+            try:
+                busy.set()
+                text = transcriber.transcribe(wav_path)
+                if text:
+                    llm.handle(text)
+                else:
+                    ui.error("Nothing transcribed — try speaking closer to the mic.")
+            except Exception as exc:  # noqa: BLE001
+                ui.error(f"Pipeline failed: {exc}")
+            finally:
+                busy.clear()
+                ui.idle()
+                jobs.task_done()
+
+    worker_thread = threading.Thread(target=worker, name="tars-worker", daemon=True)
+    worker_thread.start()
+
+    try:
+        ui.info("Warming up Whisper (first load may download the model)…")
+        transcriber.warmup()
+        ui.info("Whisper ready.")
+    except Exception as exc:  # noqa: BLE001
+        ui.error(f"Whisper failed to load: {exc}")
+        stop_event.set()
+        jobs.put(None)
+        worker_thread.join(timeout=5)
+        return 1
+
+    def on_press() -> None:
+        if recorder.is_recording or busy.is_set():
+            return
+        recorder.start()
+
+    def on_release() -> None:
+        wav = recorder.stop_and_save(TEMP_WAV)
+        if wav is not None:
+            jobs.put(wav)
+
+    listener = HotkeyListener(on_press=on_press, on_release=on_release)
+
+    print("=" * 60)
+    print("  TARS — Push-to-Talk Desktop Assistant (voice mode)")
+    print("  Hold  Ctrl+Space  to record · release to run")
+    print("  Press  Ctrl+C  to quit")
+    print("=" * 60)
+    ui.info(f"LLM provider={llm.provider} model={llm.model}")
+    ui.idle()
+
+    listener.start()
+    try:
+        while True:
+            listener.join()
+            break
+    except KeyboardInterrupt:
+        print("\nShutting down…", flush=True)
+    finally:
+        stop_event.set()
+        jobs.put(None)
+        listener.stop()
+        if recorder.is_recording:
+            recorder.stop_and_save(TEMP_WAV)
+        worker_thread.join(timeout=5)
+
+    return 0
 
 
 def main() -> int:
@@ -173,7 +164,6 @@ def main() -> int:
 
     llm = LLMOrchestrator()
 
-    # Mode switch: default CLI. Set TARS_MODE=voice later to re-enable PTT.
     mode = os.getenv("TARS_MODE", "cli").lower().strip()
     if mode in {"voice", "ptt", "push-to-talk"}:
         return run_push_to_talk(llm)
