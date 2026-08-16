@@ -1,7 +1,7 @@
 """TARS entrypoint — CLI text loop or voice push-to-talk.
 
 Both modes feed the same pipeline: text → ``llm.handle(text)`` → tools.
-Switch with ``TARS_MODE=cli`` or ``TARS_MODE=voice`` in ``.env``.
+Voice path is fully in-memory (NumPy → Whisper → LLM); no temp WAV files.
 """
 
 from __future__ import annotations
@@ -10,24 +10,23 @@ import os
 import queue
 import sys
 import threading
-from pathlib import Path
+import time
 
+import numpy as np
 from dotenv import load_dotenv
 
 from tars import ui
 from tars.audio import AudioRecorder
 from tars.hotkey import HotkeyListener
 from tars.llm import LLMOrchestrator
-from tars.transcribe import Transcriber
-
-TEMP_WAV = Path(os.environ.get("TEMP", os.environ.get("TMP", "."))) / "temp_audio.wav"
+from tars.transcribe import transcribe_audio, warmup_whisper
 
 
 def _require_llm_config() -> str | None:
     """Validate env for the selected provider. Returns an error message or None."""
     provider = os.getenv("LLM_PROVIDER", "openai").lower().strip()
     if provider == "ollama":
-        return None  # local Ollama needs no cloud API key
+        return None
     if not os.getenv("OPENAI_API_KEY"):
         return (
             "OPENAI_API_KEY is not set. Copy .env.example to .env and add your key, "
@@ -44,6 +43,7 @@ def run_cli(llm: LLMOrchestrator) -> int:
     print("  Examples: open notepad | create a folder called Demo")
     print("=" * 60)
     ui.info(f"LLM provider={llm.provider} model={llm.model}")
+    llm.warmup()
     ui.idle_cli()
 
     while True:
@@ -70,29 +70,31 @@ def run_cli(llm: LLMOrchestrator) -> int:
 
 
 def run_push_to_talk(llm: LLMOrchestrator) -> int:
-    """Push-to-talk loop: Ctrl+Space → record → Whisper → ``llm.handle(text)``."""
+    """Push-to-talk: Ctrl+Space → in-memory audio → Whisper → ``llm.handle``."""
     recorder = AudioRecorder()
-    transcriber = Transcriber(model_size=os.getenv("WHISPER_MODEL", "base"))
 
-    # Hotkey thread only enqueues paths; worker does STT + LLM (never blocks pynput).
-    jobs: queue.Queue[Path | None] = queue.Queue()
+    # Hotkey thread enqueues NumPy buffers; worker does STT + LLM.
+    jobs: queue.Queue[np.ndarray | None] = queue.Queue()
     stop_event = threading.Event()
-    busy = threading.Event()  # ignore overlapping utterances while processing
+    busy = threading.Event()
 
     def worker() -> None:
         while not stop_event.is_set():
             try:
-                wav_path = jobs.get(timeout=0.25)
+                audio = jobs.get(timeout=0.25)
             except queue.Empty:
                 continue
-            if wav_path is None:
+            if audio is None:
                 jobs.task_done()
                 break
+            pipeline_t0 = time.perf_counter()
             try:
                 busy.set()
-                text = transcriber.transcribe(wav_path)
+                text = transcribe_audio(audio)
                 if text:
+                    ui.executing_command()
                     llm.handle(text)
+                    ui.info(f"pipeline total {time.perf_counter() - pipeline_t0:.2f}s")
                 else:
                     ui.error("Nothing transcribed — try speaking closer to the mic.")
             except Exception as exc:  # noqa: BLE001
@@ -107,10 +109,11 @@ def run_push_to_talk(llm: LLMOrchestrator) -> int:
 
     try:
         ui.info("Warming up Whisper (first load may download the model)…")
-        transcriber.warmup()
+        warmup_whisper(os.getenv("WHISPER_MODEL"))
         ui.info("Whisper ready.")
+        llm.warmup()
     except Exception as exc:  # noqa: BLE001
-        ui.error(f"Whisper failed to load: {exc}")
+        ui.error(f"Warmup failed: {exc}")
         stop_event.set()
         jobs.put(None)
         worker_thread.join(timeout=5)
@@ -122,14 +125,14 @@ def run_push_to_talk(llm: LLMOrchestrator) -> int:
         recorder.start()
 
     def on_release() -> None:
-        wav = recorder.stop_and_save(TEMP_WAV)
-        if wav is not None:
-            jobs.put(wav)
+        audio = recorder.stop()
+        if audio is not None:
+            jobs.put(audio)
 
     listener = HotkeyListener(on_press=on_press, on_release=on_release)
 
     print("=" * 60)
-    print("  TARS — Push-to-Talk Desktop Assistant (voice mode)")
+    print("  TARS — Push-to-Talk (low-latency / in-memory)")
     print("  Hold  Ctrl+Space  to record · release to run")
     print("  Press  Ctrl+C  to quit")
     print("=" * 60)
@@ -148,7 +151,7 @@ def run_push_to_talk(llm: LLMOrchestrator) -> int:
         jobs.put(None)
         listener.stop()
         if recorder.is_recording:
-            recorder.stop_and_save(TEMP_WAV)
+            recorder.stop()
         worker_thread.join(timeout=5)
 
     return 0

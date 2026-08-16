@@ -1,18 +1,15 @@
-"""Thread-safe push-to-talk microphone capture via sounddevice + numpy.
+"""Thread-safe push-to-talk microphone capture (in-memory only).
 
-Hotkey press/release is handled by ``tars.hotkey``; this module only owns
-the audio buffer and WAV write (scipy.io.wavfile).
+Hotkey press/release is handled by ``tars.hotkey``. This module returns a
+mono float32 NumPy buffer at 16 kHz — no disk I/O.
 """
 
 from __future__ import annotations
 
-import tempfile
 import threading
-from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
-from scipy.io import wavfile
 
 from tars import ui
 
@@ -74,8 +71,8 @@ class AudioRecorder:
             self._stream = None
             ui.error(f"Failed to start microphone: {exc}")
 
-    def stop_and_save(self, path: Path | None = None) -> Path | None:
-        """Stop capture, write WAV, and return the path (or None if empty)."""
+    def stop(self) -> np.ndarray | None:
+        """Stop capture and return a mono float32 NumPy array (or None)."""
         with self._lock:
             if not self._recording:
                 return None
@@ -97,16 +94,18 @@ class AudioRecorder:
             return None
 
         audio = np.concatenate(chunks, axis=0)
-        if audio.size == 0 or np.max(np.abs(audio)) < 1e-6:
+        # Ensure shape (n,) float32 mono for faster-whisper
+        if audio.ndim > 1:
+            audio = audio.reshape(-1)
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
+
+        if audio.size == 0 or float(np.max(np.abs(audio))) < 1e-6:
             ui.error("Audio buffer is silent / empty.")
             return None
 
-        # float32 [-1, 1] → int16 PCM for Whisper compatibility
-        pcm = np.clip(audio, -1.0, 1.0)
-        pcm_i16 = (pcm * 32767.0).astype(np.int16)
+        ui.info(f"Captured {audio.size / self.sample_rate:.2f}s in-memory")
+        return audio
 
-        out = path or Path(tempfile.gettempdir()) / "temp_audio.wav"
-        ui.processing()
-        wavfile.write(str(out), self.sample_rate, pcm_i16)
-        ui.info(f"Saved {out} ({len(pcm_i16) / self.sample_rate:.2f}s)")
-        return out
+    # Back-compat alias if anything still calls the old name
+    def stop_and_save(self, path=None) -> np.ndarray | None:  # noqa: ARG002
+        return self.stop()

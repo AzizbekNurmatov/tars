@@ -19,15 +19,24 @@ def recording() -> None:
 
 
 def processing() -> None:
-    status("💾 [SAVING]", "Writing audio buffer to disk…")
+    status("💾 [BUFFER]", "Finalizing in-memory audio…")
 
 
 def transcribing() -> None:
     status("⚙️ [TRANSCRIBING]", "Running local Whisper…")
 
 
+def transcribed(seconds: float, text: str) -> None:
+    status("⚙️ [TRANSCRIBED]", f"in {seconds:.2f}s")
+    heard(text)
+
+
 def thinking() -> None:
     status("🧠 [THINKING]", "Sending command to LLM…")
+
+
+def executing_command() -> None:
+    status("🧠 [EXECUTING]", "Running LLM + tools…")
 
 
 def executing(tool_name: str) -> None:

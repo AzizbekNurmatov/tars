@@ -1,72 +1,112 @@
-"""Local speech-to-text via faster-whisper."""
+"""Local speech-to-text via faster-whisper (singleton, in-memory capable)."""
 
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 
+import numpy as np
 from faster_whisper import WhisperModel
 
 from tars import ui
 
-# "tiny" is fastest on CPU; "base" is a bit more accurate.
-DEFAULT_MODEL = "base"
+# English-only base is faster/smaller than multilingual "base".
+DEFAULT_MODEL = "base.en"
 DEFAULT_DEVICE = "cpu"
 DEFAULT_COMPUTE_TYPE = "int8"
+SAMPLE_RATE = 16_000
 
-# Module-level singleton used by the simple ``transcribe_audio`` helper.
-_default_transcriber: Transcriber | None = None
+# Module-level singleton — loaded once at startup, reused every utterance.
+_model: WhisperModel | None = None
+_model_name: str | None = None
+
+
+def _resolve_model_name(model_size: str | None = None) -> str:
+    return (
+        model_size
+        or os.getenv("WHISPER_MODEL")
+        or DEFAULT_MODEL
+    )
+
+
+def get_whisper_model(model_size: str | None = None) -> WhisperModel:
+    """Return the process-wide WhisperModel, creating it on first call."""
+    global _model, _model_name
+    name = _resolve_model_name(model_size)
+    if _model is not None and _model_name == name:
+        return _model
+
+    ui.info(f"Loading Whisper model '{name}' ({DEFAULT_DEVICE}/{DEFAULT_COMPUTE_TYPE})…")
+    _model = WhisperModel(name, device=DEFAULT_DEVICE, compute_type=DEFAULT_COMPUTE_TYPE)
+    _model_name = name
+    return _model
+
+
+def warmup_whisper(model_size: str | None = None) -> WhisperModel:
+    """Force-load the singleton at application startup."""
+    return get_whisper_model(model_size)
+
+
+def _normalize_audio(audio_data: np.ndarray | str | Path) -> np.ndarray | str:
+    """Accept in-memory float32 audio or a filesystem path."""
+    if isinstance(audio_data, (str, Path)):
+        return str(audio_data)
+
+    audio = np.asarray(audio_data)
+    if audio.ndim > 1:
+        audio = audio.reshape(-1)
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def transcribe_audio(
+    audio_data: np.ndarray | str | Path,
+    *,
+    model_size: str | None = None,
+    show_timing: bool = True,
+) -> str:
+    """Transcribe in-memory NumPy audio or a WAV path; return clean text.
+
+    Uses beam_size=1, language=en, vad_filter=True for low CPU latency.
+    """
+    model = get_whisper_model(model_size)
+    source = _normalize_audio(audio_data)
+
+    t0 = time.perf_counter()
+    if show_timing:
+        ui.transcribing()
+
+    segments, _info = model.transcribe(
+        source,
+        beam_size=1,
+        language="en",
+        vad_filter=True,
+        # Slightly aggressive VAD to drop leading/trailing silence faster
+        vad_parameters={"min_silence_duration_ms": 300},
+    )
+    text = " ".join(segment.text.strip() for segment in segments).strip()
+    elapsed = time.perf_counter() - t0
+
+    if show_timing:
+        ui.transcribed(elapsed, text or "(empty)")
+    else:
+        ui.heard(text or "(empty)")
+    return text
 
 
 class Transcriber:
-    """Lazy-load a Whisper model and transcribe WAV files."""
+    """Thin wrapper around the module-level Whisper singleton."""
 
     def __init__(
         self,
-        model_size: str = DEFAULT_MODEL,
-        device: str = DEFAULT_DEVICE,
-        compute_type: str = DEFAULT_COMPUTE_TYPE,
+        model_size: str | None = None,
+        device: str = DEFAULT_DEVICE,  # noqa: ARG002 — kept for API compat
+        compute_type: str = DEFAULT_COMPUTE_TYPE,  # noqa: ARG002
     ) -> None:
-        self.model_size = model_size
-        self.device = device
-        self.compute_type = compute_type
-        self._model: WhisperModel | None = None
-
-    def _ensure_model(self) -> WhisperModel:
-        if self._model is None:
-            ui.info(
-                f"Loading Whisper model '{self.model_size}' "
-                f"({self.device}/{self.compute_type})…"
-            )
-            self._model = WhisperModel(
-                self.model_size,
-                device=self.device,
-                compute_type=self.compute_type,
-            )
-        return self._model
+        self.model_size = _resolve_model_name(model_size)
 
     def warmup(self) -> None:
-        """Load model weights up front so the first utterance is faster."""
-        self._ensure_model()
+        warmup_whisper(self.model_size)
 
-    def transcribe(self, wav_path: Path | str) -> str:
-        ui.transcribing()
-        model = self._ensure_model()
-        segments, _info = model.transcribe(str(wav_path), beam_size=1, vad_filter=True)
-        text = " ".join(segment.text.strip() for segment in segments).strip()
-        ui.heard(text or "(empty)")
-        return text
-
-
-def transcribe_audio(file_path: str) -> str:
-    """Process a WAV file and return clean transcribed text.
-
-    Uses a shared local Whisper ``base`` model on CPU (int8).
-    """
-    global _default_transcriber
-    if _default_transcriber is None:
-        _default_transcriber = Transcriber(
-            model_size=DEFAULT_MODEL,
-            device=DEFAULT_DEVICE,
-            compute_type=DEFAULT_COMPUTE_TYPE,
-        )
-    return _default_transcriber.transcribe(file_path)
+    def transcribe(self, audio_data: np.ndarray | str | Path) -> str:
+        return transcribe_audio(audio_data, model_size=self.model_size)
