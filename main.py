@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 from tars import ui
 from tars.audio import AudioRecorder
-from tars.hotkey import HotkeyListener
+from tars.hotkey import HOTKEY_LABEL, HotkeyListener
 from tars.llm import LLMOrchestrator
 from tars.transcribe import transcribe_audio, warmup_whisper
 
@@ -133,17 +133,19 @@ def run_push_to_talk(llm: LLMOrchestrator) -> int:
 
     print("=" * 60)
     print("  TARS — Push-to-Talk (low-latency / in-memory)")
-    print("  Hold  Ctrl+Space  to record · release to run")
+    print(f"  Hold  {HOTKEY_LABEL}  to record · release to run")
     print("  Press  Ctrl+C  to quit")
     print("=" * 60)
     ui.info(f"LLM provider={llm.provider} model={llm.model}")
     ui.idle()
 
     listener.start()
+    # IMPORTANT: do not call listener.join() here — on Windows it blocks the
+    # main thread so KeyboardInterrupt (Ctrl+C) often never fires. Sleep in
+    # short slices instead so Ctrl+C can interrupt cleanly.
     try:
-        while True:
-            listener.join()
-            break
+        while listener.running and not stop_event.is_set():
+            time.sleep(0.2)
     except KeyboardInterrupt:
         print("\nShutting down…", flush=True)
     finally:
@@ -152,7 +154,7 @@ def run_push_to_talk(llm: LLMOrchestrator) -> int:
         listener.stop()
         if recorder.is_recording:
             recorder.stop()
-        worker_thread.join(timeout=5)
+        worker_thread.join(timeout=2)
 
     return 0
 

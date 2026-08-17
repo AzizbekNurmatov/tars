@@ -14,8 +14,9 @@ from pynput import keyboard
 
 from tars import ui
 
-# Ctrl+Space
+# Hold Ctrl+Space to talk; release to process.
 HOTKEY_KEY = keyboard.Key.space
+HOTKEY_LABEL = "Ctrl+Space"
 
 
 class HotkeyListener:
@@ -76,15 +77,20 @@ class HotkeyListener:
             except Exception as exc:  # noqa: BLE001
                 ui.error(f"on_release failed: {exc}")
 
+    @property
+    def running(self) -> bool:
+        return self._listener is not None and self._listener.is_alive()
+
     def start(self) -> None:
         self._listener = keyboard.Listener(
             on_press=self._handle_press,
             on_release=self._handle_release,
         )
         self._listener.start()
-        ui.info("Hotkey armed: hold Ctrl+Space to talk, release to process.")
+        ui.info(f"Hotkey armed: hold {HOTKEY_LABEL} to talk, release to process.")
 
     def join(self) -> None:
+        """Prefer wait_interruptible() from main — join() blocks Ctrl+C on Windows."""
         if self._listener is not None:
             self._listener.join()
 

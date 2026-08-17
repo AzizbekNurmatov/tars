@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import subprocess
+import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_plus, urlparse
 
 from tars import ui
 
@@ -25,6 +27,14 @@ APP_ALIASES: dict[str, str] = {
     "edge": "msedge",
     "word": "winword",
     "excel": "excel",
+}
+
+# Search-engine URL templates ({q} = urllib-encoded query)
+SEARCH_TEMPLATES: dict[str, str] = {
+    "google": "https://www.google.com/search?q={q}",
+    "youtube": "https://www.youtube.com/results?search_query={q}",
+    "github": "https://github.com/search?q={q}",
+    "reddit": "https://www.reddit.com/search/?q={q}",
 }
 
 
@@ -67,22 +77,61 @@ def create_folder(folder_name: str) -> str:
         return f"Failed to create folder '{path}': {exc}"
 
 
+def search_web(query: str, site: str = "google") -> str:
+    """Open a search-results page for ``query`` on the chosen site."""
+    q = (query or "").strip()
+    if not q:
+        return "Error: query is empty."
+
+    key = (site or "google").strip().lower()
+    template = SEARCH_TEMPLATES.get(key, SEARCH_TEMPLATES["google"])
+    used_site = key if key in SEARCH_TEMPLATES else "google"
+
+    url = template.format(q=quote_plus(q))
+    try:
+        # webbrowser returns quickly; the browser process is separate
+        webbrowser.open_new_tab(url)
+        return f"Opened {used_site} search for '{q}' → {url}"
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to open search URL '{url}': {exc}"
+
+
+def open_url(url: str) -> str:
+    """Open a specific URL in the default browser (adds https:// if needed)."""
+    raw = (url or "").strip()
+    if not raw:
+        return "Error: url is empty."
+
+    parsed = urlparse(raw)
+    if not parsed.scheme:
+        raw = "https://" + raw.lstrip("/")
+
+    try:
+        webbrowser.open_new_tab(raw)
+        return f"Opened URL in browser: {raw}"
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to open URL '{raw}': {exc}"
+
+
 # Extensible registry: name → callable
 TOOL_REGISTRY: dict[str, Callable[..., str]] = {
     "open_app": open_app,
     "create_folder": create_folder,
+    "search_web": search_web,
+    "open_url": open_url,
 }
 
 
-# OpenAI Chat Completions `tools` schema
+# OpenAI / Ollama Chat Completions `tools` schema (imported by llm.py)
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "open_app",
             "description": (
-                "Open / launch a desktop application on Windows. "
-                "Use for requests like 'open Notepad', 'launch Calculator', 'open VS Code'."
+                "Launch a native Windows desktop application (Notepad, Calculator, "
+                "VS Code, etc.). Use this for local apps — NOT for websites, searches, "
+                "or URLs. Examples: 'open Notepad', 'launch Calculator'."
             ),
             "parameters": {
                 "type": "object",
@@ -116,6 +165,64 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["folder_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": (
+                "Search the web and open results in the default browser. "
+                "Use when the user wants to look something up on Google, YouTube, "
+                "GitHub, or Reddit — e.g. 'search YouTube for lo-fi beats', "
+                "'google Python pathlib', 'find repos about FastAPI on GitHub'. "
+                "Do NOT use open_app for searches. Prefer search_web over open_url "
+                "when the user describes a query rather than a concrete link."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search terms to look up.",
+                    },
+                    "site": {
+                        "type": "string",
+                        "enum": ["google", "youtube", "github", "reddit"],
+                        "description": (
+                            "Which site to search. Defaults to google if omitted "
+                            "or unrecognized."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_url",
+            "description": (
+                "Open a specific website URL in the default browser. "
+                "Use when the user gives (or clearly implies) a concrete address "
+                "like 'open wikipedia.org', 'go to https://github.com', "
+                "or 'open reddit.com/r/python'. "
+                "Do NOT use open_app for websites. Use search_web instead when "
+                "they want to search for a topic rather than visit a known URL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": (
+                            "The URL or domain to open. https:// is added if missing."
+                        ),
+                    },
+                },
+                "required": ["url"],
             },
         },
     },
