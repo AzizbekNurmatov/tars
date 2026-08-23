@@ -24,13 +24,20 @@ from tars.transcribe import transcribe_audio, warmup_whisper
 
 def _require_llm_config() -> str | None:
     """Validate env for the selected provider. Returns an error message or None."""
-    provider = os.getenv("LLM_PROVIDER", "openai").lower().strip()
+    provider = os.getenv("LLM_PROVIDER", "ollama").lower().strip()
     if provider == "ollama":
         return None
-    if not os.getenv("OPENAI_API_KEY"):
+    if provider == "anthropic":
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            return (
+                "ANTHROPIC_API_KEY is not set. Paste it in .env (see the comment "
+                "above ANTHROPIC_API_KEY), then set LLM_PROVIDER=anthropic."
+            )
+        return None
+    if provider == "openai" and not os.getenv("OPENAI_API_KEY"):
         return (
-            "OPENAI_API_KEY is not set. Copy .env.example to .env and add your key, "
-            "or set LLM_PROVIDER=ollama to use a local model."
+            "OPENAI_API_KEY is not set. Add it to .env, or set LLM_PROVIDER=ollama "
+            "or LLM_PROVIDER=anthropic."
         )
     return None
 

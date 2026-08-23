@@ -10,7 +10,7 @@ The goal is to build a lightweight, extensible assistant inspired by systems lik
 * Open applications
 * Create folders
 * Pluggable tool system
-* OpenAI or local Ollama support
+* Anthropic, OpenAI, or local Ollama support
 * Shared CLI and future voice architecture
 
 ## Project Structure
@@ -48,6 +48,18 @@ copy .env.example .env
 
 ## Configuration
 
+API keys go in **`.env` only** (listed in `.gitignore`). `.env.example` is a template with no secrets.
+
+Switch backends with `LLM_PROVIDER` in `.env`: `ollama` | `anthropic` | `openai`.
+
+### Anthropic
+
+```env
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-sonnet-4-5
+```
+
 ### OpenAI
 
 ```env
@@ -61,7 +73,7 @@ OPENAI_MODEL=gpt-4o-mini
 ```env
 LLM_PROVIDER=ollama
 OLLAMA_BASE_URL=http://localhost:11434/v1
-OLLAMA_MODEL=llama3.1
+OLLAMA_MODEL=llama3.2:1b
 ```
 
 Start Ollama before running TARS:
@@ -75,11 +87,13 @@ ollama pull llama3.1
 
 | Variable          | Default                     | Description          |
 | ----------------- | --------------------------- | -------------------- |
-| `LLM_PROVIDER`    | `openai`                    | `openai` or `ollama` |
-| `OPENAI_API_KEY`  | —                           | Required for OpenAI  |
-| `OPENAI_MODEL`    | `gpt-4o-mini`               | OpenAI chat model    |
-| `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Ollama API endpoint  |
-| `OLLAMA_MODEL`    | `llama3.1`                  | Local model name     |
+| `LLM_PROVIDER`      | `ollama`                    | `ollama`, `anthropic`, or `openai` |
+| `ANTHROPIC_API_KEY` | —                           | Required for Anthropic (keep in `.env`) |
+| `ANTHROPIC_MODEL`   | `claude-sonnet-4-5`         | Claude model |
+| `OPENAI_API_KEY`    | —                           | Required for OpenAI |
+| `OPENAI_MODEL`      | `gpt-4o-mini`               | OpenAI chat model |
+| `OLLAMA_BASE_URL`   | `http://localhost:11434/v1` | Ollama API endpoint |
+| `OLLAMA_MODEL`      | `llama3.2:1b`               | Local model name |
 | `TARS_MODE`       | `cli`                       | `cli` or `voice`     |
 
 ## Running TARS
