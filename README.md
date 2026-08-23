@@ -1,172 +1,239 @@
 # TARS — Desktop Automation Assistant
 
-TARS is a desktop automation assistant that can understand natural-language commands and execute actions on your computer. The current version provides a **text-based CLI**, while the **voice / push-to-talk pipeline** remains in the project and can be re-enabled later without changing the command-processing architecture.
+**TARS** is a Windows desktop AI assistant. You type or speak a command; an LLM turns it into a tool call; Python runs the action on your PC (open apps, create folders, search the web, snap Gemini into split-screen, and more).
 
-The goal is to build a lightweight, extensible assistant inspired by systems like **JARVIS**, where both text and voice commands flow through the same LLM-powered orchestration layer.
+Inspired by systems like JARVIS: one brain, many hands — text and voice share the same pipeline.
 
-## Features
+## How it works (in 30 seconds)
 
-* Natural-language desktop commands
-* Open applications
-* Create folders
-* Pluggable tool system
-* Anthropic, OpenAI, or local Ollama support
-* Shared CLI and future voice architecture
+```text
+  You (voice or typing)
+           │
+           ▼
+  ┌─────────────────────┐
+  │  Input adapter      │  CLI: input()
+  │                     │  Voice: Ctrl+Space → mic → Whisper
+  └──────────┬──────────┘
+             │  plain text string
+             ▼
+  ┌─────────────────────┐
+  │  LLMOrchestrator    │  Ollama / Anthropic / OpenAI
+  │  (tool calling)     │
+  └──────────┬──────────┘
+             │  tool name + args
+             ▼
+  ┌─────────────────────┐
+  │  Tool registry      │  open_app, create_folder,
+  │                     │  search_web, open_url
+  └──────────┬──────────┘
+             ▼
+        Real OS action
+```
 
-## Project Structure
+**Design rule:** voice and CLI only differ at the input layer. Everything after `llm.handle(text)` is shared.
+
+---
+
+## Features & use cases
+
+### Input modes
+
+| Mode | How | Config |
+|------|-----|--------|
+| **Voice (push-to-talk)** | Hold **Ctrl+Space**, speak, release | `TARS_MODE=voice` |
+| **CLI** | Type at `Enter command:` | `TARS_MODE=cli` |
+
+### LLM backends (switch anytime)
+
+| Provider | When to use | Env |
+|----------|-------------|-----|
+| **Ollama** | Free / local / offline | `LLM_PROVIDER=ollama` |
+| **Anthropic** | Claude cloud quality | `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` |
+| **OpenAI** | GPT tool calling | `LLM_PROVIDER=openai` + `OPENAI_API_KEY` |
+
+### Tools (what TARS can do)
+
+| Tool | What it does | Example things you can say |
+|------|--------------|----------------------------|
+| `open_app` | Launch Windows apps (aliases for Notepad, Calc, VS Code, etc.) | “Open Notepad” · “Launch Calculator” |
+| `create_folder` | Create a folder on the Desktop | “Make a folder called Projects” |
+| `search_web` | Search Google, YouTube, GitHub, Reddit, or **Gemini** | “Google pathlib” · “Search lo-fi on YouTube” |
+| `search_web` + `split_screen` | Snap current window left; open search on the right | “Search quantum computing on Gemini in split screen” |
+| `open_url` | Open a concrete URL / domain | “Open github.com” |
+
+### Floating Command Pill UI (voice mode)
+
+Always-on-top, frameless, draggable pill at the bottom of the screen:
+
+| State | What you see |
+|-------|----------------|
+| **Idle** | Dark bar · “Hold Ctrl + Space” · provider tag · ✕ |
+| **Listening** | Crimson pulsing dot while you hold the hotkey |
+| **Processing** | Amber · live transcript / “Thinking…” |
+| **Success** | Emerald · expandable drawer with transcript, tool call, latency · auto-collapses after ~3s |
+
+- Native Windows 11 rounded corners (DWM)  
+- Drag by the bar; quit with **✕**, **Esc**, or **Ctrl+C**  
+- Terminal status lines still print (🔴 / ⚙️ / 🧠 / ✅)
+
+### Latency / pipeline details
+
+- In-memory audio (no temp WAV on disk)  
+- Whisper model loaded once at startup (`base.en`, CPU/int8)  
+- Ollama `keep_alive` + temperature 0 for snappy tool calls  
+- Hotkey / STT / LLM on background threads; GUI never blocks them  
+
+---
+
+## Project structure
 
 ```text
 tars/
-├── main.py              # CLI entry point + voice stub
+├── main.py                 # Entrypoint: CLI loop or voice + pill UI
 ├── requirements.txt
-├── .env.example
+├── .env.example            # Safe template (commit this)
+├── .env                    # Your secrets (gitignored — never commit)
 ├── README.md
 └── tars/
-    ├── llm.py           # OpenAI / Ollama orchestration
-    ├── tools.py         # Desktop automation tools
-    ├── registry.py      # Tool registration
-    ├── ui.py            # Terminal status helpers
-    ├── audio.py         # Voice recording (future)
-    ├── hotkey.py        # Push-to-talk hotkey (future)
-    └── transcribe.py    # Whisper transcription (future)
+    ├── llm.py              # Provider switch + tool orchestration
+    ├── tools.py            # Tool registry + schemas
+    ├── ui.py               # Terminal logs + Command Pill overlay
+    ├── audio.py            # In-memory mic capture (sounddevice)
+    ├── hotkey.py           # Global Ctrl+Space (pynput)
+    └── transcribe.py       # faster-whisper singleton
 ```
 
-## Installation
+---
 
-Clone the repository and create a virtual environment.
+## Quick start
+
+### 1. Install
 
 ```powershell
-git clone https://github.com/YOUR_USERNAME/tars.git
 cd tars
-
 python -m venv .venv
-.\\.venv\\Scripts\\Activate.ps1
-
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 copy .env.example .env
 ```
 
-## Configuration
+### 2. Configure `.env`
 
-API keys go in **`.env` only** (listed in `.gitignore`). `.env.example` is a template with no secrets.
+Pick a brain and a mode. API keys go **only** in `.env` (already in `.gitignore`).
 
-Switch backends with `LLM_PROVIDER` in `.env`: `ollama` | `anthropic` | `openai`.
-
-### Anthropic
-
-```env
-LLM_PROVIDER=anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL=claude-sonnet-4-5
-```
-
-### OpenAI
-
-```env
-LLM_PROVIDER=openai
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o-mini
-```
-
-### Ollama (Local)
+**Local Ollama (default-friendly):**
 
 ```env
 LLM_PROVIDER=ollama
 OLLAMA_BASE_URL=http://localhost:11434/v1
 OLLAMA_MODEL=llama3.2:1b
+TARS_MODE=voice
+WHISPER_MODEL=base.en
 ```
 
-Start Ollama before running TARS:
+Start Ollama first: `ollama serve` (and have the model pulled).
 
-```powershell
-ollama serve
-ollama pull llama3.1
+**Anthropic:**
+
+```env
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-sonnet-4-5
+TARS_MODE=voice
 ```
 
-## Environment Variables
+**OpenAI:**
 
-| Variable          | Default                     | Description          |
-| ----------------- | --------------------------- | -------------------- |
-| `LLM_PROVIDER`      | `ollama`                    | `ollama`, `anthropic`, or `openai` |
-| `ANTHROPIC_API_KEY` | —                           | Required for Anthropic (keep in `.env`) |
-| `ANTHROPIC_MODEL`   | `claude-sonnet-4-5`         | Claude model |
-| `OPENAI_API_KEY`    | —                           | Required for OpenAI |
-| `OPENAI_MODEL`      | `gpt-4o-mini`               | OpenAI chat model |
-| `OLLAMA_BASE_URL`   | `http://localhost:11434/v1` | Ollama API endpoint |
-| `OLLAMA_MODEL`      | `llama3.2:1b`               | Local model name |
-| `TARS_MODE`       | `cli`                       | `cli` or `voice`     |
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+TARS_MODE=voice
+```
 
-## Running TARS
-
-Start the CLI:
+### 3. Run
 
 ```powershell
 python main.py
 ```
 
-Example session:
+- **Voice:** hold Ctrl+Space → speak → release. Watch the pill + terminal.  
+- **CLI:** set `TARS_MODE=cli`, then type commands and `quit` to exit.
+
+---
+
+## Example commands
 
 ```text
-Enter command: open notepad
-Enter command: create a folder called Demo
-Enter command: quit
+open notepad
+create a folder called Demo
+search YouTube for lo-fi beats
+open Gemini and search quantum computing
+search quantum computing on Gemini in split screen
+open github.com
 ```
 
-TARS displays execution state while processing commands:
+Typical terminal flow:
 
 ```text
+🔴 [RECORDING]
+⚙️ [TRANSCRIBED] in 1.1s
+🗣️ [HEARD: "Open calculator."]
 🧠 [THINKING]
-✅ [EXECUTING]
+✅ [EXECUTING] open_app("calculator")
 💬 [ASSISTANT]
 ```
 
-## Architecture
+---
 
-Both CLI and voice modes use the same processing pipeline:
+## Environment variables
 
-```text
-User Input
-     │
-     ▼
-LLMOrchestrator.handle(text)
-     │
-     ▼
-Tool Registry
-     │
-     ▼
-Desktop Automation Tool
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_PROVIDER` | `ollama` | `ollama` · `anthropic` · `openai` |
+| `LLM_TEMPERATURE` | `0` | Deterministic tool calling |
+| `ANTHROPIC_API_KEY` | — | Required for Anthropic (`.env` only) |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-5` | Claude model id |
+| `OPENAI_API_KEY` | — | Required for OpenAI |
+| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI chat model |
+| `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Ollama OpenAI-compatible API |
+| `OLLAMA_MODEL` | `llama3.2:1b` | Local model name |
+| `OLLAMA_KEEP_ALIVE` | `5m` | Keep model resident in Ollama |
+| `TARS_MODE` | `cli` / `voice` | Input mode |
+| `WHISPER_MODEL` | `base.en` | Local STT model (`tiny.en` = faster) |
 
-This allows voice support to be added without changing the core command execution logic.
+---
 
-## Voice Mode (Planned)
+## Stack
 
-The repository already contains the voice modules:
+| Layer | Tech |
+|-------|------|
+| Language | Python 3.11+ |
+| Hotkey | `pynput` (Ctrl+Space) |
+| Audio | `sounddevice` + NumPy |
+| Speech-to-text | `faster-whisper` |
+| LLM | Ollama / Anthropic / OpenAI (tool calling) |
+| Window snap | `PyGetWindow` |
+| Overlay UI | `customtkinter` + Win11 DWM corners |
 
-* `audio.py`
-* `hotkey.py`
-* `transcribe.py`
+---
 
-To re-enable push-to-talk later:
+## Security notes
 
-1. Restore the voice imports and implementation in `main.py`
-2. Set:
+- Never commit `.env` or paste API keys into source / README / `.env.example`.  
+- Tools can open apps and browsers on your machine — treat the LLM as a privileged controller.  
+- Prefer confirming risky future tools (delete files, shell) before adding them.
 
-```env
-TARS_MODE=voice
-```
-
-3. Install the microphone / Whisper dependencies from `requirements.txt`
+---
 
 ## Roadmap
 
-* Window management
-* File search and manipulation
-* Browser automation
-* System controls (volume, brightness, Wi-Fi, Bluetooth)
-* Multi-step task execution
-* Memory and user preferences
-* Fully integrated voice mode
+- More tools (files, volume, window management)  
+- Multi-step plans / short memory  
+- Confirmation / allowlist for dangerous actions  
+- Packaging as a tray app  
+
+---
 
 ## License
 
