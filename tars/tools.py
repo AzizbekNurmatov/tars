@@ -234,7 +234,7 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> str:
     fn = TOOL_REGISTRY.get(name)
     if fn is None:
         return f"Unknown tool: {name}"
-    ui.executing(name)
+    ui.executing(name, arguments)
     ui.info(f"args={arguments}")
     result = fn(**arguments)
     ui.info(result)

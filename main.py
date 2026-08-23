@@ -2,12 +2,17 @@
 
 Both modes feed the same pipeline: text → ``llm.handle(text)`` → tools.
 Voice path is fully in-memory (NumPy → Whisper → LLM); no temp WAV files.
+
+Voice mode runs CustomTkinter on the **main thread** (required). Hotkey and
+STT/LLM stay on background threads and only enqueue pill updates — never touch
+Tk widgets directly — so there are no GUI deadlocks.
 """
 
 from __future__ import annotations
 
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -43,7 +48,7 @@ def _require_llm_config() -> str | None:
 
 
 def run_cli(llm: LLMOrchestrator) -> int:
-    """Text-based command loop."""
+    """Text-based command loop (no floating pill)."""
     print("=" * 60)
     print("  TARS — Desktop Automation Assistant (CLI mode)")
     print("  Type a command, or 'quit' / 'exit' to leave")
@@ -77,7 +82,7 @@ def run_cli(llm: LLMOrchestrator) -> int:
 
 
 def run_push_to_talk(llm: LLMOrchestrator) -> int:
-    """Push-to-talk: Ctrl+Space → in-memory audio → Whisper → ``llm.handle``."""
+    """Push-to-talk: Ctrl+Space → audio → Whisper → LLM + floating Command Pill."""
     recorder = AudioRecorder()
 
     # Hotkey thread enqueues NumPy buffers; worker does STT + LLM.
@@ -95,20 +100,28 @@ def run_push_to_talk(llm: LLMOrchestrator) -> int:
                 jobs.task_done()
                 break
             pipeline_t0 = time.perf_counter()
+            ok = False
             try:
                 busy.set()
                 text = transcribe_audio(audio)
                 if text:
                     ui.executing_command()
                     llm.handle(text)
-                    ui.info(f"pipeline total {time.perf_counter() - pipeline_t0:.2f}s")
+                    latency = time.perf_counter() - pipeline_t0
+                    ui.success("Done", latency_s=latency, transcript=text)
+                    ok = True
+                    ui.info(f"pipeline total {latency:.2f}s")
                 else:
                     ui.error("Nothing transcribed — try speaking closer to the mic.")
             except Exception as exc:  # noqa: BLE001
                 ui.error(f"Pipeline failed: {exc}")
             finally:
                 busy.clear()
-                ui.idle()
+                # Success schedules its own 3s collapse → Idle on the GUI thread.
+                if ok:
+                    ui.idle(update_pill=False)
+                else:
+                    ui.idle()
                 jobs.task_done()
 
     worker_thread = threading.Thread(target=worker, name="tars-worker", daemon=True)
@@ -134,6 +147,8 @@ def run_push_to_talk(llm: LLMOrchestrator) -> int:
     def on_release() -> None:
         audio = recorder.stop()
         if audio is not None:
+            # Show processing immediately on release (before STT finishes)
+            ui.set_state(ui.PillState.PROCESSING, "Processing…")
             jobs.put(audio)
 
     listener = HotkeyListener(on_press=on_press, on_release=on_release)
@@ -141,27 +156,65 @@ def run_push_to_talk(llm: LLMOrchestrator) -> int:
     print("=" * 60)
     print("  TARS — Push-to-Talk (low-latency / in-memory)")
     print(f"  Hold  {HOTKEY_LABEL}  to record · release to run")
-    print("  Press  Ctrl+C  to quit")
+    print("  Press  Ctrl+C, Esc, or ✕ on the pill to quit")
     print("=" * 60)
     ui.info(f"LLM provider={llm.provider} model={llm.model}")
+
+    def _shutdown(*_args: object) -> None:
+        """Shared exit path: stop hotkey + workers, then leave Tk mainloop."""
+        stop_event.set()
+        try:
+            jobs.put_nowait(None)
+        except Exception:  # noqa: BLE001
+            jobs.put(None)
+        try:
+            listener.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if recorder.is_recording:
+                recorder.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        ui.request_pill_quit()
+
+    # GUI on main thread; hotkey/worker never touch Tk widgets.
+    ui.init_command_pill(
+        hotkey_hint=HOTKEY_LABEL.replace("+", " + "),
+        provider=llm.provider,
+        on_close=_shutdown,  # ✕ button → clean teardown
+    )
     ui.idle()
 
     listener.start()
-    # IMPORTANT: do not call listener.join() here — on Windows it blocks the
-    # main thread so KeyboardInterrupt (Ctrl+C) often never fires. Sleep in
-    # short slices instead so Ctrl+C can interrupt cleanly.
+
     try:
-        while listener.running and not stop_event.is_set():
-            time.sleep(0.2)
+        signal.signal(signal.SIGINT, _shutdown)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        ui.run_command_pill()  # blocks in Tk mainloop until ✕ / Esc / Ctrl+C
     except KeyboardInterrupt:
-        print("\nShutting down…", flush=True)
+        _shutdown()
     finally:
+        print("\nShutting down…", flush=True)
         stop_event.set()
-        jobs.put(None)
-        listener.stop()
+        try:
+            jobs.put_nowait(None)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            listener.stop()
+        except Exception:  # noqa: BLE001
+            pass
         if recorder.is_recording:
-            recorder.stop()
+            try:
+                recorder.stop()
+            except Exception:  # noqa: BLE001
+                pass
         worker_thread.join(timeout=2)
+        ui.destroy_command_pill()
 
     return 0
 
