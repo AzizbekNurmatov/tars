@@ -12,7 +12,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urlparse
 
+import pyperclip
+
 from tars import ui
+
+MAX_CLIPBOARD_CHARS = 15_000
+
+CLIPBOARD_TRANSFORM_SYSTEM = (
+    "You are a concise desktop assistant. Follow the user's instruction using "
+    "the provided clipboard text. Output ONLY the direct answer/result. Do not "
+    "wrap code in markdown code fences unless explicitly asked. Do not add intro "
+    "or outro fluff (no 'Here is...', no 'Sure!')."
+)
 
 # Windows-friendly aliases → executable / shell command
 APP_ALIASES: dict[str, str] = {
@@ -266,6 +277,58 @@ def search_web(query: str, site: str = "google", split_screen: bool = False) -> 
         return f"Failed to open search URL '{url}': {exc}"
 
 
+def _clean_llm_output(text: str) -> str:
+    """Strip wrapping fences / fluff the model may still add."""
+    result = (text or "").strip()
+    if result.startswith("```") and result.endswith("```"):
+        lines = result.splitlines()
+        if len(lines) >= 2 and lines[-1].strip() == "```":
+            result = "\n".join(lines[1:-1]).strip()
+    return result
+
+
+def process_clipboard(instruction: str) -> str:
+    """Read the clipboard, transform it via the LLM, write the result back."""
+    instruction = (instruction or "").strip()
+    if not instruction:
+        return "Error: instruction is empty."
+
+    try:
+        clipboard_text = pyperclip.paste() or ""
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to read clipboard: {exc}"
+
+    if not isinstance(clipboard_text, str):
+        clipboard_text = str(clipboard_text)
+
+    if not clipboard_text.strip():
+        return "Clipboard is empty."
+
+    if len(clipboard_text) > MAX_CLIPBOARD_CHARS:
+        clipboard_text = clipboard_text[:MAX_CLIPBOARD_CHARS]
+
+    # Lazy import: llm.py imports this module for TOOL_SCHEMAS / execute_tool.
+    from tars.llm import complete_isolated
+
+    user_prompt = f"Instruction: {instruction}\n\nClipboard Content:\n{clipboard_text}"
+    try:
+        raw = complete_isolated(CLIPBOARD_TRANSFORM_SYSTEM, user_prompt)
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to transform clipboard: {exc}"
+
+    result = _clean_llm_output(raw)
+    if not result:
+        return "LLM returned an empty transformation."
+
+    try:
+        pyperclip.copy(result)
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to write clipboard: {exc}"
+
+    ui.clipboard_ready()
+    return "Transformed clipboard (ready to paste)"
+
+
 def open_url(url: str) -> str:
     """Open a specific URL in the default browser (adds https:// if needed)."""
     raw = (url or "").strip()
@@ -288,6 +351,7 @@ TOOL_REGISTRY: dict[str, Callable[..., str]] = {
     "create_folder": create_folder,
     "search_web": search_web,
     "open_url": open_url,
+    "process_clipboard": process_clipboard,
 }
 
 
@@ -401,6 +465,36 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "process_clipboard",
+            "description": (
+                "Read the user's current clipboard text, transform it according "
+                "to the instruction (rewrite, summarize, translate, fix grammar, "
+                "change tone, etc.), and write the result back to the clipboard "
+                "so they can paste with Ctrl+V. Use when they refer to 'this', "
+                "'the clipboard', copied text, or ask to rewrite / summarize / "
+                "translate / fix text they just copied. Do not invent the source "
+                "text and do not answer with the transformed text yourself — the "
+                "tool has the clipboard."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": (
+                            "Action to perform on clipboard text, e.g., "
+                            "'Make this polite', 'Summarize', 'Fix grammar', "
+                            "'Translate to English'"
+                        ),
+                    },
+                },
+                "required": ["instruction"],
             },
         },
     },

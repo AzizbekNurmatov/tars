@@ -43,6 +43,20 @@ Tool selection guide:
   or alongside the current window; otherwise leave it false.
 - open_url → open a specific URL or domain the user named
   (e.g. "open github.com", "go to https://example.com").
+- process_clipboard → read whatever is on the clipboard, transform it per the
+  user's instruction, and write the result back to the clipboard (they paste
+  with Ctrl+V). The source text is already copied — you will not see it.
+  Examples:
+  • "Make this sound professional"
+      → process_clipboard(instruction="Make this sound professional")
+  • "Summarize this in 3 bullets"
+      → process_clipboard(instruction="Summarize this in 3 bullets")
+  • "Translate to Spanish"
+      → process_clipboard(instruction="Translate to Spanish")
+  • "Fix the grammar" / "Make this polite" / "Rewrite this as an email"
+      → process_clipboard with that instruction.
+  Use this whenever they say "this", "the clipboard", or ask to rewrite,
+  summarize, translate, or fix text they just copied.
 
 Rules:
 1. If the user asks to open/launch/start a desktop app → call open_app.
@@ -50,10 +64,13 @@ Rules:
 3. If the user asks to search / look up / find something on the web or a site
    (YouTube, Google, GitHub, Reddit, Gemini) → call search_web with the right site.
 4. If the user gives a concrete website or URL → call open_url (not open_app).
-5. You may call multiple tools if needed.
-6. Prefer tool calls over asking clarifying questions when the intent is clear.
-7. After tools run, briefly confirm what you did in plain language.
-8. If the request is not actionable with your tools, say so briefly.
+5. If the user wants to transform, rewrite, summarize, translate, or fix
+   copied / clipboard text → call process_clipboard. Do not produce the
+   rewritten text yourself; the tool has the clipboard.
+6. You may call multiple tools if needed.
+7. Prefer tool calls over asking clarifying questions when the intent is clear.
+8. After tools run, briefly confirm what you did in plain language.
+9. If the request is not actionable with your tools, say so briefly.
 """
 
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
@@ -63,6 +80,11 @@ DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434/v1"
 DEFAULT_KEEP_ALIVE = "5m"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_ANTHROPIC_MAX_TOKENS = 1024
+DEFAULT_TRANSFORM_MAX_TOKENS = 8192
+
+# Set by LLMOrchestrator.__init__ so tools can run isolated completions
+# without constructing a second client (and without a circular import).
+_active_orchestrator: LLMOrchestrator | None = None
 
 
 def _openai_tools_to_anthropic() -> list[dict[str, Any]]:
@@ -162,6 +184,9 @@ class LLMOrchestrator:
                 self.base_url,
             )
 
+        global _active_orchestrator
+        _active_orchestrator = self
+
     def _openai_completion_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"temperature": self.temperature}
         if self.provider == "ollama":
@@ -193,6 +218,38 @@ class LLMOrchestrator:
             ui.info(f"LLM ready in {time.perf_counter() - t0:.2f}s{extra}")
         except Exception as exc:  # noqa: BLE001
             ui.error(f"LLM warmup failed (will retry on first command): {exc}")
+
+    def complete(
+        self,
+        user_text: str,
+        *,
+        system: str,
+        max_tokens: int = DEFAULT_TRANSFORM_MAX_TOKENS,
+    ) -> str:
+        """Plain completion with no tool calling (isolated clipboard transforms)."""
+        if self.provider == "anthropic":
+            response = self._anthropic.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user_text}],
+            )
+            return "".join(
+                block.text
+                for block in response.content
+                if getattr(block, "type", None) == "text"
+            ).strip()
+
+        response = self._openai.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text},
+            ],
+            max_tokens=max_tokens,
+            **self._openai_completion_kwargs(),
+        )
+        return (response.choices[0].message.content or "").strip()
 
     def handle(self, user_text: str) -> str:
         if not user_text.strip():
@@ -336,3 +393,9 @@ class LLMOrchestrator:
         else:
             ui.info("Model returned no tool calls and no text.")
         return text
+
+
+def complete_isolated(system: str, user_text: str) -> str:
+    """Run a no-tools completion on the active (or a newly built) orchestrator."""
+    orch = _active_orchestrator or LLMOrchestrator()
+    return orch.complete(user_text, system=system)

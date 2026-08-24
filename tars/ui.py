@@ -36,10 +36,12 @@ class PillPayload:
     transcript: str | None = None
     action: str | None = None
     latency_s: float | None = None
+    collapse_ms: int | None = None
 
 
 _pill: CommandPill | None = None
 _pill_lock = threading.Lock()
+_clipboard_ready = False
 
 _DOT_IDLE = "#6B6B70"
 _DOT_LISTEN = "#E11D48"
@@ -47,6 +49,9 @@ _DOT_PROCESS = "#F59E0B"
 _DOT_SUCCESS = "#10B981"
 
 DRAWER_COLLAPSE_MS = 3000
+CLIPBOARD_READY_MS = 3500
+CLIPBOARD_PROCESSING_MESSAGE = "📋 Processing clipboard..."
+CLIPBOARD_READY_MESSAGE = "✅ Ready in clipboard! [Ctrl + V]"
 BAR_HEIGHT = 52
 DRAWER_HEIGHT = 118
 EXPANDED_HEIGHT = BAR_HEIGHT + DRAWER_HEIGHT
@@ -93,6 +98,7 @@ def set_state(
     transcript: str | None = None,
     action: str | None = None,
     latency_s: float | None = None,
+    collapse_ms: int | None = None,
 ) -> None:
     """Thread-safe visual update (no-op if pill not started)."""
     pill = _pill
@@ -107,6 +113,7 @@ def set_state(
             transcript=transcript,
             action=action,
             latency_s=latency_s,
+            collapse_ms=collapse_ms,
         )
     )
 
@@ -453,14 +460,15 @@ class CommandPill:
                 pass
             self._collapse_after = None
 
-    def _schedule_collapse_to_idle(self) -> None:
+    def _schedule_collapse_to_idle(self, delay_ms: int | None = None) -> None:
         self._cancel_collapse()
 
         def _go_idle() -> None:
             self._collapse_after = None
             self._apply(PillPayload(PillState.IDLE))
 
-        self._collapse_after = self.root.after(self._collapse_ms, _go_idle)
+        delay = self._collapse_ms if delay_ms is None else delay_ms
+        self._collapse_after = self.root.after(delay, _go_idle)
 
     def _truncate(self, text: str, limit: int = 42) -> str:
         t = text.strip()
@@ -500,7 +508,10 @@ class CommandPill:
             self.shell.configure(border_color="#3F2E10")
             self.dot.configure(text_color=_DOT_PROCESS)
             msg = payload.message or self._last_transcript or "Processing…"
-            self.status.configure(text=self._truncate(msg), text_color=FG)
+            if payload.message == CLIPBOARD_PROCESSING_MESSAGE:
+                self.status.configure(text=msg, text_color=FG)
+            else:
+                self.status.configure(text=self._truncate(msg), text_color=FG)
             return
 
         self.shell.configure(border_color="#0F3D2E")
@@ -516,7 +527,7 @@ class CommandPill:
         self.line_action.configure(text=f"⚡  {self._truncate(a, 52)}")
         self.line_latency.configure(text=f"⏱  {lat_txt}")
         self._expand_drawer()
-        self._schedule_collapse_to_idle()
+        self._schedule_collapse_to_idle(payload.collapse_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +577,28 @@ def executing_command() -> None:
 def executing(tool_name: str, arguments: dict[str, Any] | None = None) -> None:
     call = format_tool_call(tool_name, arguments)
     status("✅ [EXECUTING]", call)
+    if tool_name == "process_clipboard":
+        processing_clipboard(action=call)
+        return
     set_state(PillState.PROCESSING, call, action=call)
+
+
+def processing_clipboard(*, action: str | None = None) -> None:
+    """Amber top-pill while the clipboard transformer runs."""
+    status("📋 [CLIPBOARD]", "Processing clipboard...")
+    set_state(PillState.PROCESSING, CLIPBOARD_PROCESSING_MESSAGE, action=action)
+
+
+def clipboard_ready() -> None:
+    """Emerald top-pill: result is on the clipboard; collapse to Idle in 3.5s."""
+    global _clipboard_ready
+    _clipboard_ready = True
+    status("✅ [CLIPBOARD]", "Ready in clipboard! [Ctrl + V]")
+    set_state(
+        PillState.SUCCESS,
+        CLIPBOARD_READY_MESSAGE,
+        collapse_ms=CLIPBOARD_READY_MS,
+    )
 
 
 def success(
@@ -576,6 +608,18 @@ def success(
     transcript: str | None = None,
     action: str | None = None,
 ) -> None:
+    global _clipboard_ready
+    if _clipboard_ready:
+        _clipboard_ready = False
+        set_state(
+            PillState.SUCCESS,
+            CLIPBOARD_READY_MESSAGE,
+            transcript=transcript,
+            action=action,
+            latency_s=latency_s,
+            collapse_ms=CLIPBOARD_READY_MS,
+        )
+        return
     set_state(
         PillState.SUCCESS,
         message,
