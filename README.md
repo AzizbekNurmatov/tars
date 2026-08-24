@@ -1,6 +1,6 @@
 # TARS — Desktop Automation Assistant
 
-**TARS** is a Windows desktop AI assistant. You type or speak a command; an LLM turns it into a tool call; Python runs the action on your PC (open apps, create folders, search the web, snap Gemini into split-screen, and more).
+**TARS** is a Windows desktop AI assistant. You type or speak a command; an LLM turns it into a tool call; Python runs the action on your PC (open apps, create folders, search the web, transform or write the clipboard, snap Gemini into split-screen, and more). It keeps a short in-memory conversation window so follow-ups like “do that again” or “put my last prompts on the clipboard” work.
 
 Inspired by systems like JARVIS: one brain, many hands — text and voice share the same pipeline.
 
@@ -18,13 +18,16 @@ Inspired by systems like JARVIS: one brain, many hands — text and voice share 
              ▼
   ┌─────────────────────┐
   │  LLMOrchestrator    │  Ollama / Anthropic / OpenAI
-  │  (tool calling)     │
+  │  (tool calling +    │  last 5 turns kept in RAM
+  │   rolling memory)   │
   └──────────┬──────────┘
              │  tool name + args
              ▼
   ┌─────────────────────┐
   │  Tool registry      │  open_app, create_folder,
-  │                     │  search_web, open_url
+  │                     │  search_web, open_url,
+  │                     │  process_clipboard,
+  │                     │  write_clipboard
   └──────────┬──────────┘
              ▼
         Real OS action
@@ -60,6 +63,14 @@ Inspired by systems like JARVIS: one brain, many hands — text and voice share 
 | `search_web` | Search Google, YouTube, GitHub, Reddit, or **Gemini** | “Google pathlib” · “Search lo-fi on YouTube” |
 | `search_web` + `split_screen` | Snap current window left; open search on the right | “Search quantum computing on Gemini in split screen” |
 | `open_url` | Open a concrete URL / domain | “Open github.com” |
+| `process_clipboard` | Read copied text, transform it, write the result back | Copy a draft, then “Make this sound professional” · “Summarize this in 3 bullets” · “Translate to Spanish” |
+| `write_clipboard` | Generate **new** text and copy it (not a rewrite of what’s already copied) | “Write a short ocean poem and put it on my clipboard” · “Put my last three prompts on the clipboard” |
+
+**Clipboard vs write:** `process_clipboard` rewrites whatever you already copied. `write_clipboard` places brand-new content (a poem, recalled prompts, notes) so you can paste with **Ctrl+V**. Copied payloads stay off the conversation window — history only stores a tiny `[prior] used …` receipt so the model does not pretend a past tool call just happened.
+
+### Conversational memory
+
+The orchestrator keeps the last **5 user turns + 5 assistant receipts** in a RAM-only sliding window (`deque`, no disk). Isolated clipboard transforms do not pollute that window. Follow-ups such as “make it shorter”, “do that again”, or “give me my last prompts” resolve against those prior user messages.
 
 ### Floating Command Pill UI (voice mode)
 
@@ -69,8 +80,9 @@ Always-on-top, frameless, draggable pill at the bottom of the screen:
 |-------|----------------|
 | **Idle** | Dark bar · “Hold Ctrl + Space” · provider tag · ✕ |
 | **Listening** | Crimson pulsing dot while you hold the hotkey |
-| **Processing** | Amber · live transcript / “Thinking…” |
+| **Processing** | Amber · live transcript / “Thinking…” / **📋 Processing clipboard...** |
 | **Success** | Emerald · expandable drawer with transcript, tool call, latency · auto-collapses after ~3s |
+| **Clipboard ready** | Emerald · **✅ Ready in clipboard! [Ctrl + V]** · holds 3.5s, then Idle |
 
 - Native Windows 11 rounded corners (DWM)  
 - Drag by the bar; quit with **✕**, **Esc**, or **Ctrl+C**  
@@ -79,6 +91,7 @@ Always-on-top, frameless, draggable pill at the bottom of the screen:
 ### Latency / pipeline details
 
 - In-memory audio (no temp WAV on disk)  
+- Conversation history is RAM-only (no transcript files)  
 - Whisper model loaded once at startup (`base.en`, CPU/int8)  
 - Ollama `keep_alive` + temperature 0 for snappy tool calls  
 - Hotkey / STT / LLM on background threads; GUI never blocks them  
@@ -95,8 +108,8 @@ tars/
 ├── .env                    # Your secrets (gitignored — never commit)
 ├── README.md
 └── tars/
-    ├── llm.py              # Provider switch + tool orchestration
-    ├── tools.py            # Tool registry + schemas
+    ├── llm.py              # Provider switch + tool orchestration + RAM history
+    ├── tools.py            # Tool registry + schemas (incl. clipboard)
     ├── ui.py               # Terminal logs + Command Pill overlay
     ├── audio.py            # In-memory mic capture (sounddevice)
     ├── hotkey.py           # Global Ctrl+Space (pynput)
@@ -171,6 +184,10 @@ search YouTube for lo-fi beats
 open Gemini and search quantum computing
 search quantum computing on Gemini in split screen
 open github.com
+make this sound professional
+summarize this in 3 bullets
+write a short poem about the ocean and put it on my clipboard
+put my last three prompts on the clipboard
 ```
 
 Typical terminal flow:
@@ -182,6 +199,15 @@ Typical terminal flow:
 🧠 [THINKING]
 ✅ [EXECUTING] open_app("calculator")
 💬 [ASSISTANT]
+```
+
+Clipboard (copy text first, then speak):
+
+```text
+🗣️ [HEARD: "Make this sound professional"]
+✅ [EXECUTING] process_clipboard("Make this sound professional")
+📋 [CLIPBOARD] Processing clipboard...
+✅ [CLIPBOARD] Ready in clipboard! [Ctrl + V]
 ```
 
 ---
@@ -213,6 +239,7 @@ Typical terminal flow:
 | Audio | `sounddevice` + NumPy |
 | Speech-to-text | `faster-whisper` |
 | LLM | Ollama / Anthropic / OpenAI (tool calling) |
+| Clipboard | `pyperclip` |
 | Window snap | `PyGetWindow` |
 | Overlay UI | `customtkinter` + Win11 DWM corners |
 
@@ -221,7 +248,7 @@ Typical terminal flow:
 ## Security notes
 
 - Never commit `.env` or paste API keys into source / README / `.env.example`.  
-- Tools can open apps and browsers on your machine — treat the LLM as a privileged controller.  
+- Tools can open apps and browsers, and can read/write the clipboard — treat the LLM as a privileged controller.  
 - Prefer confirming risky future tools (delete files, shell) before adding them.
 
 ---
@@ -229,7 +256,7 @@ Typical terminal flow:
 ## Roadmap
 
 - More tools (files, volume, window management)  
-- Multi-step plans / short memory  
+- Longer / optional persistent memory beyond the 5-turn RAM window  
 - Confirmation / allowlist for dangerous actions  
 - Packaging as a tray app  
 
