@@ -301,16 +301,23 @@ def process_clipboard(instruction: str) -> str:
     if not isinstance(clipboard_text, str):
         clipboard_text = str(clipboard_text)
 
-    if not clipboard_text.strip():
-        return "Clipboard is empty."
-
     if len(clipboard_text) > MAX_CLIPBOARD_CHARS:
         clipboard_text = clipboard_text[:MAX_CLIPBOARD_CHARS]
 
     # Lazy import: llm.py imports this module for TOOL_SCHEMAS / execute_tool.
     from tars.llm import complete_isolated
 
-    user_prompt = f"Instruction: {instruction}\n\nClipboard Content:\n{clipboard_text}"
+    if clipboard_text.strip():
+        user_prompt = (
+            f"Instruction: {instruction}\n\nClipboard Content:\n{clipboard_text}"
+        )
+    else:
+        # Nothing copied — treat the instruction as a request to generate text.
+        user_prompt = (
+            f"Instruction: {instruction}\n\n"
+            "No clipboard text was provided. Follow the instruction and output "
+            "ONLY the result that should be placed on the clipboard."
+        )
     try:
         raw = complete_isolated(CLIPBOARD_TRANSFORM_SYSTEM, user_prompt)
     except Exception as exc:  # noqa: BLE001
@@ -327,6 +334,22 @@ def process_clipboard(instruction: str) -> str:
 
     ui.clipboard_ready()
     return "Transformed clipboard (ready to paste)"
+
+
+def write_clipboard(text: str) -> str:
+    """Copy exact text onto the clipboard (generated notes, recalled prompts, etc.)."""
+    payload = text if isinstance(text, str) else str(text or "")
+    payload = payload.strip()
+    if not payload:
+        return "Error: text is empty."
+    if len(payload) > MAX_CLIPBOARD_CHARS:
+        payload = payload[:MAX_CLIPBOARD_CHARS]
+    try:
+        pyperclip.copy(payload)
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to write clipboard: {exc}"
+    ui.clipboard_ready()
+    return "Copied to clipboard (ready to paste)"
 
 
 def open_url(url: str) -> str:
@@ -352,6 +375,7 @@ TOOL_REGISTRY: dict[str, Callable[..., str]] = {
     "search_web": search_web,
     "open_url": open_url,
     "process_clipboard": process_clipboard,
+    "write_clipboard": write_clipboard,
 }
 
 
@@ -495,6 +519,33 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["instruction"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_clipboard",
+            "description": (
+                "Copy the exact provided text onto the user's clipboard so they "
+                "can paste with Ctrl+V. Use when they ask to put generated text, "
+                "a list, recalled prior prompts, a poem, notes, or any NEW content "
+                "on the clipboard. Pass the full text in `text` — describing it in "
+                "your chat reply does not copy it. Do NOT use this to transform "
+                "text that is already on the clipboard (use process_clipboard)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "Exact string to place on the clipboard, e.g. a poem, "
+                            "a numbered list of prior user prompts, or notes."
+                        ),
+                    },
+                },
+                "required": ["text"],
             },
         },
     },

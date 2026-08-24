@@ -577,7 +577,7 @@ def executing_command() -> None:
 def executing(tool_name: str, arguments: dict[str, Any] | None = None) -> None:
     call = format_tool_call(tool_name, arguments)
     status("✅ [EXECUTING]", call)
-    if tool_name == "process_clipboard":
+    if tool_name in {"process_clipboard", "write_clipboard"}:
         processing_clipboard(action=call)
         return
     set_state(PillState.PROCESSING, call, action=call)

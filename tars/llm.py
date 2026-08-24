@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import deque
 from typing import Any
 
 from openai import OpenAI
@@ -44,19 +45,23 @@ Tool selection guide:
 - open_url → open a specific URL or domain the user named
   (e.g. "open github.com", "go to https://example.com").
 - process_clipboard → read whatever is on the clipboard, transform it per the
-  user's instruction, and write the result back to the clipboard (they paste
-  with Ctrl+V). The source text is already copied — you will not see it.
-  Examples:
+  user's instruction, and write the result back (they paste with Ctrl+V).
+  Use this ONLY to rewrite / summarize / translate / fix text they already copied.
+  You will not see the source text. Examples:
   • "Make this sound professional"
       → process_clipboard(instruction="Make this sound professional")
   • "Summarize this in 3 bullets"
       → process_clipboard(instruction="Summarize this in 3 bullets")
-  • "Translate to Spanish"
-      → process_clipboard(instruction="Translate to Spanish")
-  • "Fix the grammar" / "Make this polite" / "Rewrite this as an email"
-      → process_clipboard with that instruction.
-  Use this whenever they say "this", "the clipboard", or ask to rewrite,
-  summarize, translate, or fix text they just copied.
+- write_clipboard → copy exact text YOU provide onto the clipboard.
+  Use this when they want NEW content on the clipboard: a poem, notes, a list,
+  or their prior prompts from this conversation. Pass the full string in `text`.
+  Talking about the text in your reply does NOT copy it — you must call the tool.
+  Examples:
+  • "Write a short poem about the ocean and put it on my clipboard"
+      → write_clipboard(text="<the poem>")
+  • "Give me my last prompts and put them on my clipboard"
+      → write_clipboard(text="1. ...\\n2. ...") using the user messages in
+        prior turns. Do not invent prompts; copy them from history.
 
 Rules:
 1. If the user asks to open/launch/start a desktop app → call open_app.
@@ -64,13 +69,20 @@ Rules:
 3. If the user asks to search / look up / find something on the web or a site
    (YouTube, Google, GitHub, Reddit, Gemini) → call search_web with the right site.
 4. If the user gives a concrete website or URL → call open_url (not open_app).
-5. If the user wants to transform, rewrite, summarize, translate, or fix
-   copied / clipboard text → call process_clipboard. Do not produce the
-   rewritten text yourself; the tool has the clipboard.
-6. You may call multiple tools if needed.
-7. Prefer tool calls over asking clarifying questions when the intent is clear.
-8. After tools run, briefly confirm what you did in plain language.
-9. If the request is not actionable with your tools, say so briefly.
+5. If the user wants to transform text already on the clipboard → call
+   process_clipboard. Do not produce the rewritten text yourself.
+6. If the user wants generated or recalled text ON the clipboard (poems, notes,
+   "put my last prompts on the clipboard") → call write_clipboard with the exact
+   text. Never claim you copied something unless you called write_clipboard or
+   process_clipboard in THIS turn.
+7. You may call multiple tools if needed.
+8. Prefer tool calls over asking clarifying questions when the intent is clear.
+9. After tools run, briefly confirm what you did in plain language.
+10. If the request is not actionable with your tools, say so briefly.
+11. Prior turns are included. Lines starting with "[prior]" are historical
+    receipts, not actions you just took. Use user messages there to recall
+    earlier prompts. Follow-ups like "do that again" or "put those on my
+    clipboard" must still call a tool this turn.
 """
 
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
@@ -81,6 +93,11 @@ DEFAULT_KEEP_ALIVE = "5m"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_ANTHROPIC_MAX_TOKENS = 1024
 DEFAULT_TRANSFORM_MAX_TOKENS = 8192
+
+# 5 user turns + 5 assistant receipts. Strictly in-process — no disk I/O.
+HISTORY_WINDOW = 10
+# Spoken confirmation stored in the window (never tool payloads / clipboard).
+HISTORY_REPLY_CAP = 400
 
 # Set by LLMOrchestrator.__init__ so tools can run isolated completions
 # without constructing a second client (and without a circular import).
@@ -120,6 +137,14 @@ def _build_openai_client(
     if base_url:
         kwargs["base_url"] = base_url
     return OpenAI(**kwargs)
+
+
+def _clip_history_text(text: str, limit: int = HISTORY_REPLY_CAP) -> str:
+    """Hard-cap text kept in the rolling window."""
+    clipped = (text or "").strip()
+    if len(clipped) <= limit:
+        return clipped
+    return clipped[: limit - 1] + "…"
 
 
 class LLMOrchestrator:
@@ -186,6 +211,44 @@ class LLMOrchestrator:
 
         global _active_orchestrator
         _active_orchestrator = self
+
+        # Rolling conversational memory (5 user + 5 assistant). Process RAM only.
+        self.conversation_history: deque[dict[str, str]] = deque(maxlen=HISTORY_WINDOW)
+
+    def _seed_messages(self, user_text: str, *, anthropic: bool = False) -> list[dict[str, Any]]:
+        """System prompt + sliding window + the new user turn. Shallow-copied."""
+        history = [
+            {"role": item["role"], "content": item["content"]}
+            for item in self.conversation_history
+        ]
+        if anthropic:
+            return [*history, {"role": "user", "content": user_text}]
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *history,
+            {"role": "user", "content": user_text},
+        ]
+
+    def _remember(
+        self,
+        user_text: str,
+        *,
+        tool_names: list[str],
+        reply: str,
+    ) -> None:
+        """Record this turn. Tool payloads are replaced with a tiny receipt."""
+        self.conversation_history.append(
+            {"role": "user", "content": user_text.strip()}
+        )
+        if tool_names:
+            executed = ", ".join(tool_names)
+            receipt = f"[prior] used {executed}."
+            summary = _clip_history_text(reply)
+            content = f"{receipt} {summary}" if summary else receipt
+            self.conversation_history.append({"role": "assistant", "content": content})
+            return
+        summary = _clip_history_text(reply) or "(no reply)"
+        self.conversation_history.append({"role": "assistant", "content": summary})
 
     def _openai_completion_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"temperature": self.temperature}
@@ -264,10 +327,7 @@ class LLMOrchestrator:
         ui.thinking()
         ui.info(f"provider={self.provider} model={self.model}")
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text},
-        ]
+        messages: list[dict[str, Any]] = self._seed_messages(user_text)
 
         response = self._openai.chat.completions.create(
             model=self.model,
@@ -287,6 +347,7 @@ class LLMOrchestrator:
                 ui.llm_message(text)
             else:
                 ui.info("Model returned no tool calls and no text.")
+            self._remember(user_text, tool_names=[], reply=text)
             return text
 
         payload = [
@@ -313,6 +374,7 @@ class LLMOrchestrator:
             }
         )
 
+        tool_names = [tc.function.name for tc in tool_calls]
         for tc in tool_calls:
             try:
                 args = json.loads(tc.function.arguments or "{}")
@@ -321,6 +383,7 @@ class LLMOrchestrator:
                 ui.error(result)
             else:
                 result = execute_tool(tc.function.name, args)
+            # Full tool output stays on this turn's payload only — not in history.
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": result}
             )
@@ -334,6 +397,7 @@ class LLMOrchestrator:
         ui.info(f"LLM total {time.perf_counter() - t0:.2f}s")
         if final:
             ui.llm_message(final)
+        self._remember(user_text, tool_names=tool_names, reply=final)
         return final
 
     def _handle_anthropic(self, user_text: str) -> str:
@@ -342,9 +406,7 @@ class LLMOrchestrator:
         ui.info(f"provider={self.provider} model={self.model}")
 
         tools = _openai_tools_to_anthropic()
-        messages: list[dict[str, Any]] = [
-            {"role": "user", "content": user_text},
-        ]
+        messages: list[dict[str, Any]] = self._seed_messages(user_text, anthropic=True)
 
         response = self._anthropic.messages.create(
             model=self.model,
@@ -356,6 +418,7 @@ class LLMOrchestrator:
         ui.info(f"LLM first response in {time.perf_counter() - t0:.2f}s")
 
         # Loop until Claude stops requesting tools
+        tool_names: list[str] = []
         while response.stop_reason == "tool_use":
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             payload = [
@@ -368,6 +431,7 @@ class LLMOrchestrator:
             for block in tool_uses:
                 args = block.input if isinstance(block.input, dict) else {}
                 result = execute_tool(block.name, args)
+                tool_names.append(block.name)
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -375,6 +439,7 @@ class LLMOrchestrator:
                         "content": result,
                     }
                 )
+            # Full tool output stays on this turn's payload only — not in history.
             messages.append({"role": "user", "content": tool_results})
             response = self._anthropic.messages.create(
                 model=self.model,
@@ -392,6 +457,7 @@ class LLMOrchestrator:
             ui.llm_message(text)
         else:
             ui.info("Model returned no tool calls and no text.")
+        self._remember(user_text, tool_names=tool_names, reply=text)
         return text
 
 
