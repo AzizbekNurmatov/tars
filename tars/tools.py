@@ -8,6 +8,7 @@ import sys
 import time
 import webbrowser
 from collections.abc import Callable
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urlparse
@@ -17,6 +18,7 @@ import pyperclip
 from tars import ui
 
 MAX_CLIPBOARD_CHARS = 15_000
+MAX_FILE_CHARS = 20_000
 
 CLIPBOARD_TRANSFORM_SYSTEM = (
     "You are a concise desktop assistant. Follow the user's instruction using "
@@ -42,6 +44,32 @@ APP_ALIASES: dict[str, str] = {
     "word": "winword",
     "excel": "excel",
 }
+
+
+def requires_confirmation(fn: Callable[..., str]) -> Callable[..., str]:
+    """Pause for a CLI y/n before running a destructive tool."""
+
+    @wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        path = kwargs.get("path")
+        if path is None and args:
+            path = args[0]
+        try:
+            preview = str(Path(str(path)).expanduser().resolve()) if path else fn.__name__
+        except Exception:  # noqa: BLE001
+            preview = str(path or fn.__name__)
+
+        ui.awaiting_confirmation(preview)
+        print(f"\n⚠️  About to DELETE file:\n   {preview}", flush=True)
+        try:
+            answer = input("    Confirm delete? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return f"Cancelled: delete_file was not confirmed ({preview})."
+        if answer not in {"y", "yes"}:
+            return f"User declined delete_file ({preview})."
+        return fn(*args, **kwargs)
+
+    return wrapper
 
 # Search-engine URL templates ({q} = urllib-encoded query)
 SEARCH_TEMPLATES: dict[str, str] = {
@@ -352,6 +380,53 @@ def write_clipboard(text: str) -> str:
     return "Copied to clipboard (ready to paste)"
 
 
+def _resolve_file_path(path: str) -> Path | str:
+    """Return a resolved Path, or an error string."""
+    raw = (path or "").strip()
+    if not raw:
+        return "Error: path is empty."
+    target = Path(raw).expanduser()
+    try:
+        return target.resolve()
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to resolve path '{raw}': {exc}"
+
+
+def read_file(path: str) -> str:
+    """Read a text file from disk (utf-8, truncated if huge)."""
+    target = _resolve_file_path(path)
+    if isinstance(target, str):
+        return target
+    if not target.exists():
+        return f"Error: file not found: {target}"
+    if not target.is_file():
+        return f"Error: not a file: {target}"
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to read '{target}': {exc}"
+    if len(text) > MAX_FILE_CHARS:
+        text = text[:MAX_FILE_CHARS] + "\n… [truncated]"
+    return text
+
+
+@requires_confirmation
+def delete_file(path: str) -> str:
+    """Delete a regular file after CLI y/n confirmation."""
+    target = _resolve_file_path(path)
+    if isinstance(target, str):
+        return target
+    if not target.exists():
+        return f"Error: file not found: {target}"
+    if not target.is_file():
+        return f"Error: refusing to delete (not a regular file): {target}"
+    try:
+        os.remove(target)
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to delete '{target}': {exc}"
+    return f"Deleted file '{target}'."
+
+
 def open_url(url: str) -> str:
     """Open a specific URL in the default browser (adds https:// if needed)."""
     raw = (url or "").strip()
@@ -376,6 +451,8 @@ TOOL_REGISTRY: dict[str, Callable[..., str]] = {
     "open_url": open_url,
     "process_clipboard": process_clipboard,
     "write_clipboard": write_clipboard,
+    "read_file": read_file,
+    "delete_file": delete_file,
 }
 
 
@@ -546,6 +623,52 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read the contents of a text file at the given path. "
+                "Use when the user asks to open, show, summarize, or inspect a file. "
+                "You may chain this with other tools (e.g. read then write_clipboard)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute or user-relative path to the file "
+                            "(e.g. C:\\\\Users\\\\me\\\\Desktop\\\\notes.txt)."
+                        ),
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": (
+                "Permanently delete a file at the given path. The user must type "
+                "y/n in the terminal before the delete proceeds. Never use this "
+                "on folders. Prefer this only when they clearly ask to delete/remove "
+                "a file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or user-relative path of the file to delete.",
+                    },
+                },
+                "required": ["path"],
             },
         },
     },

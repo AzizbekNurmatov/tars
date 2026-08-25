@@ -574,6 +574,12 @@ def executing_command() -> None:
     set_state(PillState.PROCESSING, "Executing…")
 
 
+def awaiting_confirmation(detail: str = "") -> None:
+    """Amber pill while the CLI waits for y/n."""
+    status("⚠️ [CONFIRM]", detail)
+    set_state(PillState.PROCESSING, "Waiting for confirmation…")
+
+
 def executing(tool_name: str, arguments: dict[str, Any] | None = None) -> None:
     call = format_tool_call(tool_name, arguments)
     status("✅ [EXECUTING]", call)

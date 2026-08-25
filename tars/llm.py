@@ -62,6 +62,12 @@ Tool selection guide:
   • "Give me my last prompts and put them on my clipboard"
       → write_clipboard(text="1. ...\\n2. ...") using the user messages in
         prior turns. Do not invent prompts; copy them from history.
+- read_file → read a text file from disk. Use when they ask to open, show,
+  inspect, or summarize a file. You can chain: read_file then write_clipboard
+  or process the text in a later tool call.
+- delete_file → permanently delete a file. The app will pause for a y/n
+  confirmation in the terminal. Never call this for folders. Only when they
+  clearly ask to delete/remove a file.
 
 Rules:
 1. If the user asks to open/launch/start a desktop app → call open_app.
@@ -75,14 +81,19 @@ Rules:
    "put my last prompts on the clipboard") → call write_clipboard with the exact
    text. Never claim you copied something unless you called write_clipboard or
    process_clipboard in THIS turn.
-7. You may call multiple tools if needed.
-8. Prefer tool calls over asking clarifying questions when the intent is clear.
-9. After tools run, briefly confirm what you did in plain language.
-10. If the request is not actionable with your tools, say so briefly.
-11. Prior turns are included. Lines starting with "[prior]" are historical
-    receipts, not actions you just took. Use user messages there to recall
-    earlier prompts. Follow-ups like "do that again" or "put those on my
-    clipboard" must still call a tool this turn.
+7. If the user asks to read/show/open a file on disk → call read_file.
+8. If the user asks to delete/remove a file → call delete_file (they must
+   confirm y/n in the terminal).
+9. You may call multiple tools, including chaining across rounds (read a file,
+   then write the summary to the clipboard, then confirm). Keep calling tools
+   until the task is actually done; only then reply with a short confirmation.
+10. Prefer tool calls over asking clarifying questions when the intent is clear.
+11. After tools run, briefly confirm what you did in plain language.
+12. If the request is not actionable with your tools, say so briefly.
+13. Prior turns are included. Lines starting with "[prior]" are historical
+    receipts. Lines starting with "[tool:" are raw results from tools already
+    run. Follow-ups like "do that again" or "put those on my clipboard" must
+    still call a tool this turn.
 """
 
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
@@ -94,10 +105,14 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_ANTHROPIC_MAX_TOKENS = 1024
 DEFAULT_TRANSFORM_MAX_TOKENS = 8192
 
-# 5 user turns + 5 assistant receipts. Strictly in-process — no disk I/O.
-HISTORY_WINDOW = 10
-# Spoken confirmation stored in the window (never tool payloads / clipboard).
+# 5 user turns + assistant receipts + tool results. Strictly in-process.
+HISTORY_WINDOW = 24
+# Spoken confirmation stored in the window (never huge payloads).
 HISTORY_REPLY_CAP = 400
+# Raw tool results kept in the rolling window (current-turn messages stay full).
+HISTORY_TOOL_CAP = 4000
+# Safety cap so a confused model cannot loop forever.
+MAX_AGENT_STEPS = 8
 
 # Set by LLMOrchestrator.__init__ so tools can run isolated completions
 # without constructing a second client (and without a circular import).
@@ -212,43 +227,50 @@ class LLMOrchestrator:
         global _active_orchestrator
         _active_orchestrator = self
 
-        # Rolling conversational memory (5 user + 5 assistant). Process RAM only.
+        # Rolling conversational memory. Process RAM only.
         self.conversation_history: deque[dict[str, str]] = deque(maxlen=HISTORY_WINDOW)
 
-    def _seed_messages(self, user_text: str, *, anthropic: bool = False) -> list[dict[str, Any]]:
-        """System prompt + sliding window + the new user turn. Shallow-copied."""
-        history = [
+    def _history_snapshot(self) -> list[dict[str, str]]:
+        return [
             {"role": item["role"], "content": item["content"]}
             for item in self.conversation_history
         ]
-        if anthropic:
-            return [*history, {"role": "user", "content": user_text}]
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *history,
-            {"role": "user", "content": user_text},
-        ]
 
-    def _remember(
-        self,
-        user_text: str,
-        *,
-        tool_names: list[str],
-        reply: str,
-    ) -> None:
-        """Record this turn. Tool payloads are replaced with a tiny receipt."""
+    def _coalesce_roles(self, items: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Merge consecutive same-role text messages (Anthropic requires alternation)."""
+        merged: list[dict[str, str]] = []
+        for item in items:
+            if (
+                merged
+                and merged[-1]["role"] == item["role"]
+                and isinstance(merged[-1]["content"], str)
+                and isinstance(item["content"], str)
+            ):
+                merged[-1]["content"] = merged[-1]["content"] + "\n" + item["content"]
+            else:
+                merged.append(item)
+        return merged
+
+    def _working_messages(self, *, anthropic: bool = False) -> list[dict[str, Any]]:
+        """Build the current agent-loop payload from conversation_history."""
+        history = self._history_snapshot()
+        if anthropic:
+            return self._coalesce_roles(history)  # type: ignore[return-value]
+        return [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+
+    def _record_tool_result(self, name: str, result: str) -> None:
+        """Persist the raw tool output so the next LLM round (and later turns) can see it."""
         self.conversation_history.append(
-            {"role": "user", "content": user_text.strip()}
+            {
+                "role": "assistant",
+                "content": f"[tool:{name}] {_clip_history_text(result, HISTORY_TOOL_CAP)}",
+            }
         )
-        if tool_names:
-            executed = ", ".join(tool_names)
-            receipt = f"[prior] used {executed}."
-            summary = _clip_history_text(reply)
-            content = f"{receipt} {summary}" if summary else receipt
-            self.conversation_history.append({"role": "assistant", "content": content})
-            return
-        summary = _clip_history_text(reply) or "(no reply)"
-        self.conversation_history.append({"role": "assistant", "content": summary})
+
+    def _record_final(self, reply: str) -> None:
+        self.conversation_history.append(
+            {"role": "assistant", "content": _clip_history_text(reply) or "(no reply)"}
+        )
 
     def _openai_completion_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"temperature": self.temperature}
@@ -318,95 +340,95 @@ class LLMOrchestrator:
         if not user_text.strip():
             ui.error("Empty command — skipping LLM.")
             return ""
+        self.conversation_history.append(
+            {"role": "user", "content": user_text.strip()}
+        )
         if self.provider == "anthropic":
-            return self._handle_anthropic(user_text)
-        return self._handle_openai_compat(user_text)
+            return self._handle_anthropic()
+        return self._handle_openai_compat()
 
-    def _handle_openai_compat(self, user_text: str) -> str:
+    def _handle_openai_compat(self) -> str:
         t0 = time.perf_counter()
         ui.thinking()
         ui.info(f"provider={self.provider} model={self.model}")
 
-        messages: list[dict[str, Any]] = self._seed_messages(user_text)
+        # Working set for this turn: system + history (already includes this user).
+        messages: list[dict[str, Any]] = self._working_messages()
+        steps = 0
 
-        response = self._openai.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",
-            **self._openai_completion_kwargs(),
-        )
+        while steps < MAX_AGENT_STEPS:
+            steps += 1
+            ui.thinking()
+            response = self._openai.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                tool_choice="auto",
+                **self._openai_completion_kwargs(),
+            )
+            message = response.choices[0].message
+            tool_calls = message.tool_calls or []
 
-        message = response.choices[0].message
-        tool_calls = message.tool_calls or []
-        ui.info(f"LLM first token path in {time.perf_counter() - t0:.2f}s")
+            if not tool_calls:
+                text = (message.content or "").strip()
+                ui.info(f"LLM total {time.perf_counter() - t0:.2f}s steps={steps}")
+                if text:
+                    ui.llm_message(text)
+                else:
+                    ui.info("Model returned no tool calls and no text.")
+                self._record_final(text)
+                return text
 
-        if not tool_calls:
-            text = (message.content or "").strip()
-            if text:
-                ui.llm_message(text)
-            else:
-                ui.info("Model returned no tool calls and no text.")
-            self._remember(user_text, tool_names=[], reply=text)
-            return text
+            payload = [
+                {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
+                for tc in tool_calls
+            ]
+            ui.info(f"tool_calls={json.dumps(payload, ensure_ascii=False)}")
 
-        payload = [
-            {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
-            for tc in tool_calls
-        ]
-        ui.info(f"tool_calls={json.dumps(payload, ensure_ascii=False)}")
-
-        messages.append(
-            {
-                "role": "assistant",
-                "content": message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in tool_calls
-                ],
-            }
-        )
-
-        tool_names = [tc.function.name for tc in tool_calls]
-        for tc in tool_calls:
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                result = f"Invalid JSON arguments: {tc.function.arguments}"
-                ui.error(result)
-            else:
-                result = execute_tool(tc.function.name, args)
-            # Full tool output stays on this turn's payload only — not in history.
             messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": result}
+                {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                }
             )
 
-        followup = self._openai.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            **self._openai_completion_kwargs(),
-        )
-        final = (followup.choices[0].message.content or "").strip()
-        ui.info(f"LLM total {time.perf_counter() - t0:.2f}s")
-        if final:
-            ui.llm_message(final)
-        self._remember(user_text, tool_names=tool_names, reply=final)
-        return final
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    result = f"Invalid JSON arguments: {tc.function.arguments}"
+                    ui.error(result)
+                else:
+                    result = execute_tool(tc.function.name, args)
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+                )
+                self._record_tool_result(tc.function.name, result)
 
-    def _handle_anthropic(self, user_text: str) -> str:
+        text = "Stopped after too many tool steps."
+        ui.error(text)
+        self._record_final(text)
+        return text
+
+    def _handle_anthropic(self) -> str:
         t0 = time.perf_counter()
         ui.thinking()
         ui.info(f"provider={self.provider} model={self.model}")
 
         tools = _openai_tools_to_anthropic()
-        messages: list[dict[str, Any]] = self._seed_messages(user_text, anthropic=True)
+        messages: list[dict[str, Any]] = self._working_messages(anthropic=True)
+        steps = 0
 
         response = self._anthropic.messages.create(
             model=self.model,
@@ -417,9 +439,8 @@ class LLMOrchestrator:
         )
         ui.info(f"LLM first response in {time.perf_counter() - t0:.2f}s")
 
-        # Loop until Claude stops requesting tools
-        tool_names: list[str] = []
-        while response.stop_reason == "tool_use":
+        while response.stop_reason == "tool_use" and steps < MAX_AGENT_STEPS:
+            steps += 1
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             payload = [
                 {"id": b.id, "name": b.name, "arguments": b.input} for b in tool_uses
@@ -431,7 +452,7 @@ class LLMOrchestrator:
             for block in tool_uses:
                 args = block.input if isinstance(block.input, dict) else {}
                 result = execute_tool(block.name, args)
-                tool_names.append(block.name)
+                self._record_tool_result(block.name, result)
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -439,8 +460,8 @@ class LLMOrchestrator:
                         "content": result,
                     }
                 )
-            # Full tool output stays on this turn's payload only — not in history.
             messages.append({"role": "user", "content": tool_results})
+            ui.thinking()
             response = self._anthropic.messages.create(
                 model=self.model,
                 max_tokens=DEFAULT_ANTHROPIC_MAX_TOKENS,
@@ -452,12 +473,15 @@ class LLMOrchestrator:
         text = "".join(
             block.text for block in response.content if getattr(block, "type", None) == "text"
         ).strip()
-        ui.info(f"LLM total {time.perf_counter() - t0:.2f}s")
+        if steps >= MAX_AGENT_STEPS and response.stop_reason == "tool_use":
+            text = text or "Stopped after too many tool steps."
+            ui.error(text)
+        ui.info(f"LLM total {time.perf_counter() - t0:.2f}s steps={steps}")
         if text:
             ui.llm_message(text)
         else:
             ui.info("Model returned no tool calls and no text.")
-        self._remember(user_text, tool_names=tool_names, reply=text)
+        self._record_final(text)
         return text
 
 
