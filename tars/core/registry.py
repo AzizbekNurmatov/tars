@@ -16,6 +16,10 @@ from tars import ui
 # Match the historical TOOL_SCHEMAS order so the model sees the same catalog.
 _SCHEMA_ORDER = (
     "open_app",
+    "bring_to_front",
+    "focus_zen_mode",
+    "tile_windows",
+    "restore_workspace",
     "create_folder",
     "search_web",
     "open_url",
