@@ -366,6 +366,7 @@ class LLMOrchestrator:
         return (response.choices[0].message.content or "").strip()
 
     def handle(self, user_text: str) -> str:
+        """Run the agent loop. Returns the assistant's final conversational text."""
         if not user_text.strip():
             ui.error("Empty command — skipping LLM.")
             return ""
@@ -375,6 +376,16 @@ class LLMOrchestrator:
         if self.provider == "anthropic":
             return self._handle_anthropic()
         return self._handle_openai_compat()
+
+    def _finalize_turn(self, text: str) -> str:
+        """Record, surface, and return the assistant's last conversational string."""
+        reply = (text or "").strip()
+        self._record_final(reply)
+        if reply:
+            ui.llm_message(reply)
+        else:
+            ui.info("Model returned no tool calls and no text.")
+        return reply
 
     def _handle_openai_compat(self) -> str:
         t0 = time.perf_counter()
@@ -401,12 +412,7 @@ class LLMOrchestrator:
             if not tool_calls:
                 text = (message.content or "").strip()
                 ui.info(f"LLM total {time.perf_counter() - t0:.2f}s steps={steps}")
-                if text:
-                    ui.llm_message(text)
-                else:
-                    ui.info("Model returned no tool calls and no text.")
-                self._record_final(text)
-                return text
+                return self._finalize_turn(text)
 
             payload = [
                 {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
@@ -447,8 +453,7 @@ class LLMOrchestrator:
 
         text = "Stopped after too many tool steps."
         ui.error(text)
-        self._record_final(text)
-        return text
+        return self._finalize_turn(text)
 
     def _handle_anthropic(self) -> str:
         t0 = time.perf_counter()
@@ -506,12 +511,7 @@ class LLMOrchestrator:
             text = text or "Stopped after too many tool steps."
             ui.error(text)
         ui.info(f"LLM total {time.perf_counter() - t0:.2f}s steps={steps}")
-        if text:
-            ui.llm_message(text)
-        else:
-            ui.info("Model returned no tool calls and no text.")
-        self._record_final(text)
-        return text
+        return self._finalize_turn(text)
 
 
 def complete_isolated(system: str, user_text: str) -> str:

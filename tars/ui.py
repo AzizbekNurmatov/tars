@@ -27,6 +27,7 @@ class PillState(str, Enum):
     LISTENING = "listening"
     PROCESSING = "processing"
     CONFIRMATION = "confirmation"
+    REPLY = "reply"
     ERROR = "error"
     SUCCESS = "success"
 
@@ -37,6 +38,7 @@ class PillPayload:
     message: str = ""
     transcript: str | None = None
     action: str | None = None
+    reply: str | None = None
     latency_s: float | None = None
     collapse_ms: int | None = None
 
@@ -57,13 +59,16 @@ _DOT_SUCCESS = "#10B981"
 DRAWER_COLLAPSE_MS = 3000
 ERROR_HOLD_MS = 4000
 CLIPBOARD_READY_MS = 3500
+REPLY_HOLD_MS = 6000
 CLIPBOARD_PROCESSING_MESSAGE = "📋 Processing clipboard..."
 CLIPBOARD_READY_MESSAGE = "✅ Ready in clipboard! [Ctrl + V]"
 CONFIRMATION_MESSAGE = "⚠️ Awaiting Confirmation · Hold Ctrl+Space to reply"
+ASSISTANT_ASKS_MESSAGE = "💬 Assistant asks... [Hold Ctrl+Space to reply]"
 BAR_HEIGHT = 52
-DRAWER_HEIGHT = 118
+DRAWER_HEIGHT = 132
 EXPANDED_HEIGHT = BAR_HEIGHT + DRAWER_HEIGHT
 FIXED_WIDTH = 420
+DRAWER_WRAP = FIXED_WIDTH - 56
 BG = "#121214"
 BORDER = "#2A2A2E"
 FG = "#EDEDED"
@@ -105,10 +110,16 @@ def set_state(
     *,
     transcript: str | None = None,
     action: str | None = None,
+    reply: str | None = None,
     latency_s: float | None = None,
     collapse_ms: int | None = None,
 ) -> None:
-    """Thread-safe visual update (no-op if pill not started)."""
+    """Thread-safe visual update (no-op if pill not started).
+
+    Background threads must use this (or the helpers below). ``CommandPill.post``
+    enqueues the payload; the GUI thread's ``after()`` poller is the only
+    code that touches Tk widgets.
+    """
     pill = _pill
     if pill is None:
         return
@@ -120,6 +131,7 @@ def set_state(
             message=message,
             transcript=transcript,
             action=action,
+            reply=reply,
             latency_s=latency_s,
             collapse_ms=collapse_ms,
         )
@@ -215,6 +227,7 @@ class CommandPill:
         self._current_height = BAR_HEIGHT
         self._last_transcript = ""
         self._last_action = ""
+        self._last_reply = ""
         self._last_latency: float | None = None
 
         ctk.set_appearance_mode("dark")
@@ -226,6 +239,9 @@ class CommandPill:
         self.root.attributes("-topmost", True)
         self.root.configure(fg_color=BG)
         self.root.resizable(False, False)
+
+        self._font_ui = ctk.CTkFont(family="Segoe UI", size=12)
+        self._font_mono = ctk.CTkFont(family="Consolas", size=12)
 
         self.shell = ctk.CTkFrame(
             self.root,
@@ -298,16 +314,18 @@ class CommandPill:
             text="",
             anchor="w",
             justify="left",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            font=self._font_ui,
             text_color=FG,
+            wraplength=DRAWER_WRAP,
         )
         self.line_action = ctk.CTkLabel(
             self.card,
             text="",
             anchor="w",
             justify="left",
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=self._font_mono,
             text_color="#C4B5FD",
+            wraplength=DRAWER_WRAP,
         )
         self.line_latency = ctk.CTkLabel(
             self.card,
@@ -410,7 +428,16 @@ class CommandPill:
     # -- thread bridge ---------------------------------------------------
 
     def post(self, payload: PillPayload) -> None:
+        """Enqueue a visual update. The GUI thread applies it via ``after()``."""
         self._q.put(payload)
+
+    def _flush_queue(self) -> None:
+        """Apply every pending payload. GUI thread only."""
+        try:
+            while True:
+                self._apply(self._q.get_nowait())
+        except queue.Empty:
+            pass
 
     def request_quit(self) -> None:
         """Ask the GUI thread to leave mainloop (safe from any thread)."""
@@ -439,11 +466,7 @@ class CommandPill:
             except Exception:  # noqa: BLE001
                 pass
             return
-        try:
-            while True:
-                self._apply(self._q.get_nowait())
-        except queue.Empty:
-            pass
+        self._flush_queue()
         self.root.after(40, self._drain_queue)
 
     def _stop_pulse(self) -> None:
@@ -482,18 +505,34 @@ class CommandPill:
         t = text.strip()
         return t if len(t) <= limit else t[: limit - 1] + "…"
 
+    def _paint_reply_drawer(self, *, transcript: str, reply: str, footer: str) -> None:
+        heard = transcript.strip() or "—"
+        self.line_transcript.configure(
+            text=f'🗣️  "{self._truncate(heard, 52)}"',
+            font=self._font_ui,
+            text_color=FG,
+        )
+        self.line_action.configure(
+            text=f"💬  {self._truncate(reply, 280)}",
+            font=self._font_ui,
+            text_color=FG,
+        )
+        self.line_latency.configure(text=footer)
+
     def _apply(self, payload: PillPayload) -> None:
         if payload.transcript is not None:
             self._last_transcript = payload.transcript
         if payload.action is not None:
             self._last_action = payload.action
+        if payload.reply is not None:
+            self._last_reply = payload.reply
         if payload.latency_s is not None:
             self._last_latency = payload.latency_s
 
         state = payload.state
         self._stop_pulse()
 
-        if state not in {PillState.SUCCESS, PillState.ERROR}:
+        if state not in {PillState.SUCCESS, PillState.ERROR, PillState.REPLY}:
             self._cancel_collapse()
 
         if state == PillState.IDLE:
@@ -532,14 +571,39 @@ class CommandPill:
             )
             return
 
+        if state == PillState.REPLY:
+            self.shell.configure(border_color="#3F2E10")
+            self.dot.configure(text_color=_DOT_CONFIRM)
+            self.status.configure(
+                text=payload.message or ASSISTANT_ASKS_MESSAGE,
+                text_color=FG,
+            )
+            body = self._last_reply or payload.reply or payload.action or ""
+            self._paint_reply_drawer(
+                transcript=self._last_transcript,
+                reply=body,
+                footer="⏱  Hold Ctrl+Space to reply",
+            )
+            self._expand_drawer()
+            self._schedule_collapse_to_idle(payload.collapse_ms or REPLY_HOLD_MS)
+            return
+
         if state == PillState.ERROR:
             self.shell.configure(border_color="#4C1515")
             self.dot.configure(text_color=_DOT_ERROR)
             short = payload.message or "❌ Error"
             self.status.configure(text=short, text_color=FG)
             full = payload.action or short
-            self.line_transcript.configure(text="❌  Error")
-            self.line_action.configure(text=self._truncate(full, 72))
+            self.line_transcript.configure(
+                text="❌  Error",
+                font=self._font_ui,
+                text_color=FG,
+            )
+            self.line_action.configure(
+                text=self._truncate(full, 72),
+                font=self._font_ui,
+                text_color=FG,
+            )
             self.line_latency.configure(text="⏱  Auto-clear in 4s")
             self._expand_drawer()
             self._schedule_collapse_to_idle(payload.collapse_ms or ERROR_HOLD_MS)
@@ -551,12 +615,28 @@ class CommandPill:
 
         t = self._last_transcript or "—"
         a = self._last_action or "—"
+        reply = payload.reply if payload.reply is not None else ""
         lat = self._last_latency
         lat_txt = f"Executed in {lat:.2f}s" if lat is not None else "Executed"
 
-        self.line_transcript.configure(text=f'🗣️  "{self._truncate(t, 52)}"')
-        self.line_action.configure(text=f"⚡  {self._truncate(a, 52)}")
-        self.line_latency.configure(text=f"⏱  {lat_txt}")
+        if reply:
+            self._paint_reply_drawer(
+                transcript=t,
+                reply=reply,
+                footer=f"⏱  {lat_txt}",
+            )
+        else:
+            self.line_transcript.configure(
+                text=f'🗣️  "{self._truncate(t, 52)}"',
+                font=self._font_ui,
+                text_color=FG,
+            )
+            self.line_action.configure(
+                text=f"⚡  {self._truncate(a, 52)}",
+                font=self._font_mono,
+                text_color="#C4B5FD",
+            )
+            self.line_latency.configure(text=f"⏱  {lat_txt}")
         self._expand_drawer()
         self._schedule_collapse_to_idle(payload.collapse_ms)
 
@@ -685,6 +765,88 @@ def clipboard_ready() -> None:
     )
 
 
+def preview_words(text: str, max_words: int = 7, max_chars: int = 40) -> str:
+    """First few words of assistant text for the compact pill label."""
+    words = (text or "").split()
+    if not words:
+        return ""
+    preview = " ".join(words[:max_words])
+    overflow = len(words) > max_words
+    if len(preview) > max_chars:
+        preview = preview[: max_chars - 1].rstrip()
+        overflow = True
+    if overflow:
+        preview = preview.rstrip(".,;:…") + "…"
+    return preview
+
+
+def is_assistant_question(text: str) -> bool:
+    return (text or "").rstrip().endswith("?")
+
+
+def present_assistant_reply(
+    text: str,
+    *,
+    transcript: str | None = None,
+    latency_s: float | None = None,
+) -> None:
+    """Show the LLM's final text on the pill (preview) and in the drawer (full).
+
+    Questions linger 6s with an awaiting-reply prompt; other replies collapse
+    on the usual success timer. Always dispatched via ``set_state`` / ``after()``.
+    """
+    global _clipboard_ready, _permission_pending, _error_visible
+    cleaned = (text or "").strip()
+
+    if _clipboard_ready:
+        _clipboard_ready = False
+        set_state(
+            PillState.SUCCESS,
+            CLIPBOARD_READY_MESSAGE,
+            transcript=transcript,
+            reply=cleaned or None,
+            latency_s=latency_s,
+            collapse_ms=CLIPBOARD_READY_MS,
+        )
+        return
+
+    if not cleaned:
+        if _permission_pending:
+            set_state(PillState.CONFIRMATION, CONFIRMATION_MESSAGE)
+            return
+        if _error_visible:
+            return
+        set_state(
+            PillState.SUCCESS,
+            "Done",
+            transcript=transcript,
+            latency_s=latency_s,
+        )
+        return
+
+    _error_visible = False
+
+    if is_assistant_question(cleaned):
+        set_state(
+            PillState.REPLY,
+            ASSISTANT_ASKS_MESSAGE,
+            transcript=transcript,
+            reply=cleaned,
+            latency_s=latency_s,
+            collapse_ms=REPLY_HOLD_MS,
+        )
+        return
+
+    _permission_pending = False
+    set_state(
+        PillState.SUCCESS,
+        preview_words(cleaned),
+        transcript=transcript,
+        reply=cleaned,
+        latency_s=latency_s,
+    )
+
+
 def success(
     message: str = "Done",
     *,
@@ -744,4 +906,5 @@ def heard(text: str) -> None:
 
 
 def llm_message(text: str) -> None:
+    """Print the assistant's final text. Voice mode paints the pill from ``main``."""
     print(f"\n💬 [ASSISTANT]\n   {text}", flush=True)

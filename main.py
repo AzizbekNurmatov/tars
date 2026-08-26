@@ -100,16 +100,25 @@ def run_push_to_talk(llm: LLMOrchestrator) -> int:
                 jobs.task_done()
                 break
             pipeline_t0 = time.perf_counter()
-            ok = False
             try:
                 busy.set()
                 text = transcribe_audio(audio)
                 if text:
                     ui.executing_command()
-                    llm.handle(text)
+                    final_text = ""
+                    try:
+                        final_text = llm.handle(text)
+                    finally:
+                        # Always leave Thinking, even if handle() raises.
+                        # set_state enqueues for the GUI thread's after() poller;
+                        # SUCCESS / REPLY / ERROR posted below replace this Idle.
+                        ui.set_state(ui.PillState.IDLE)
                     latency = time.perf_counter() - pipeline_t0
-                    ui.success("Done", latency_s=latency, transcript=text)
-                    ok = True
+                    ui.present_assistant_reply(
+                        final_text,
+                        transcript=text,
+                        latency_s=latency,
+                    )
                     ui.info(f"pipeline total {latency:.2f}s")
                 else:
                     ui.error("Nothing transcribed — try speaking closer to the mic.")
@@ -117,11 +126,7 @@ def run_push_to_talk(llm: LLMOrchestrator) -> int:
                 ui.error(f"Pipeline failed: {exc}")
             finally:
                 busy.clear()
-                # Success schedules its own 3s collapse → Idle on the GUI thread.
-                if ok:
-                    ui.idle(update_pill=False)
-                else:
-                    ui.idle()
+                ui.idle(update_pill=False)
                 jobs.task_done()
 
     worker_thread = threading.Thread(target=worker, name="tars-worker", daemon=True)
