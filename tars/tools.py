@@ -10,7 +10,7 @@ import webbrowser
 from collections.abc import Callable
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import quote_plus, urlparse
 
 import pyperclip
@@ -19,6 +19,17 @@ from tars import ui
 
 MAX_CLIPBOARD_CHARS = 15_000
 MAX_FILE_CHARS = 20_000
+MAX_UNDO_BYTES = 2_000_000
+
+
+class UndoRecord(TypedDict):
+    kind: str
+    path: str
+    previous_bytes: bytes | None
+    created: bool
+
+
+_ACTION_STACK: list[UndoRecord] = []
 
 CLIPBOARD_TRANSFORM_SYSTEM = (
     "You are a concise desktop assistant. Follow the user's instruction using "
@@ -47,10 +58,16 @@ APP_ALIASES: dict[str, str] = {
 
 
 def requires_confirmation(fn: Callable[..., str]) -> Callable[..., str]:
-    """Pause for a CLI y/n before running a destructive tool."""
+    """Block destructive tools until the LLM passes confirmed=True (spoken yes)."""
 
     @wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> str:
+        confirmed = kwargs.pop("confirmed", False)
+        if isinstance(confirmed, str):
+            confirmed = confirmed.strip().lower() in {"true", "yes", "1"}
+        else:
+            confirmed = bool(confirmed)
+
         path = kwargs.get("path")
         if path is None and args:
             path = args[0]
@@ -59,17 +76,35 @@ def requires_confirmation(fn: Callable[..., str]) -> Callable[..., str]:
         except Exception:  # noqa: BLE001
             preview = str(path or fn.__name__)
 
-        ui.awaiting_confirmation(preview)
-        print(f"\n⚠️  About to DELETE file:\n   {preview}", flush=True)
-        try:
-            answer = input("    Confirm delete? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return f"Cancelled: delete_file was not confirmed ({preview})."
-        if answer not in {"y", "yes"}:
-            return f"User declined delete_file ({preview})."
+        if not confirmed:
+            ui.awaiting_confirmation(preview)
+            return (
+                f"ACTION BLOCKED: Permission required from user to execute "
+                f"{fn.__name__} on {preview}. Ask the user for explicit "
+                f"confirmation before proceeding."
+            )
         return fn(*args, **kwargs)
 
     return wrapper
+
+
+def _push_undo(
+    kind: str,
+    path: Path,
+    *,
+    previous_bytes: bytes | None = None,
+    created: bool = False,
+) -> None:
+    if previous_bytes is not None and len(previous_bytes) > MAX_UNDO_BYTES:
+        previous_bytes = previous_bytes[:MAX_UNDO_BYTES]
+    _ACTION_STACK.append(
+        {
+            "kind": kind,
+            "path": str(path),
+            "previous_bytes": previous_bytes,
+            "created": created,
+        }
+    )
 
 # Search-engine URL templates ({q} = urllib-encoded query)
 SEARCH_TEMPLATES: dict[str, str] = {
@@ -134,11 +169,14 @@ def create_folder(folder_name: str) -> str:
         desktop = onedrive_desktop if onedrive_desktop.is_dir() else desktop
 
     path = desktop / name
+    created_new = not path.exists()
     try:
         path.mkdir(parents=False, exist_ok=True)
-        return f"Created folder at '{path}'."
     except Exception as exc:  # noqa: BLE001
         return f"Failed to create folder '{path}': {exc}"
+    if created_new:
+        _push_undo("create_folder", path, created=True)
+    return f"Created folder at '{path}'."
 
 
 def _primary_work_area() -> tuple[int, int, int, int]:
@@ -421,10 +459,83 @@ def delete_file(path: str) -> str:
     if not target.is_file():
         return f"Error: refusing to delete (not a regular file): {target}"
     try:
+        snapshot = target.read_bytes()
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to snapshot '{target}' before delete: {exc}"
+    try:
         os.remove(target)
     except Exception as exc:  # noqa: BLE001
         return f"Failed to delete '{target}': {exc}"
+    _push_undo("delete_file", target, previous_bytes=snapshot)
     return f"Deleted file '{target}'."
+
+
+def write_file(path: str, content: str) -> str:
+    """Write text to a file (creates or overwrites)."""
+    target = _resolve_file_path(path)
+    if isinstance(target, str):
+        return target
+    payload = content if isinstance(content, str) else str(content or "")
+    if len(payload) > MAX_FILE_CHARS:
+        payload = payload[:MAX_FILE_CHARS]
+    parent = target.parent
+    if not parent.exists() or not parent.is_dir():
+        return f"Error: parent folder does not exist: {parent}"
+
+    created = not target.exists()
+    previous: bytes | None = None
+    if target.is_file():
+        try:
+            previous = target.read_bytes()
+        except Exception as exc:  # noqa: BLE001
+            return f"Failed to snapshot '{target}' before write: {exc}"
+    elif target.exists():
+        return f"Error: refusing to overwrite non-file: {target}"
+
+    try:
+        target.write_text(payload, encoding="utf-8", newline="\n")
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to write '{target}': {exc}"
+    _push_undo("write_file", target, previous_bytes=previous, created=created)
+    return f"Wrote {len(payload)} characters to '{target}'."
+
+
+def undo_last_action() -> str:
+    """Reverse the last deterministic filesystem action, if possible."""
+    if not _ACTION_STACK:
+        return "Nothing to undo."
+    rec = _ACTION_STACK.pop()
+    kind = rec["kind"]
+    path = Path(rec["path"])
+    try:
+        if kind == "create_folder":
+            if not path.exists():
+                return f"Undo: folder already gone ('{path}')."
+            path.rmdir()
+            return f"Undo: removed folder '{path}'."
+        if kind == "write_file":
+            if rec["created"]:
+                if path.is_file():
+                    os.remove(path)
+                return f"Undo: deleted newly written file '{path}'."
+            previous = rec["previous_bytes"]
+            if previous is None:
+                return f"Undo: no snapshot for '{path}'."
+            path.write_bytes(previous)
+            return f"Undo: restored previous contents of '{path}'."
+        if kind == "delete_file":
+            previous = rec["previous_bytes"]
+            if previous is None:
+                return f"Undo: no snapshot to restore '{path}'."
+            if path.exists():
+                return f"Undo failed: '{path}' already exists."
+            path.write_bytes(previous)
+            return f"Undo: restored deleted file '{path}'."
+    except Exception as exc:  # noqa: BLE001
+        _ACTION_STACK.append(rec)
+        return f"Undo failed for {kind} '{path}': {exc}"
+    _ACTION_STACK.append(rec)
+    return f"Cannot undo '{kind}'."
 
 
 def open_url(url: str) -> str:
@@ -452,7 +563,9 @@ TOOL_REGISTRY: dict[str, Callable[..., str]] = {
     "process_clipboard": process_clipboard,
     "write_clipboard": write_clipboard,
     "read_file": read_file,
+    "write_file": write_file,
     "delete_file": delete_file,
+    "undo_last_action": undo_last_action,
 }
 
 
@@ -653,12 +766,42 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "write_file",
+            "description": (
+                "Create or overwrite a text file at the given path with the "
+                "provided content. Parent folder must already exist. Use for "
+                "'save this to a file', 'write notes.txt on my Desktop', etc. "
+                "Can be undone with undo_last_action."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute or user-relative file path "
+                            "(e.g. C:\\\\Users\\\\me\\\\Desktop\\\\notes.txt)."
+                        ),
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full text to write into the file.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delete_file",
             "description": (
-                "Permanently delete a file at the given path. The user must type "
-                "y/n in the terminal before the delete proceeds. Never use this "
-                "on folders. Prefer this only when they clearly ask to delete/remove "
-                "a file."
+                "Permanently delete a file at the given path. Never use this "
+                "on folders. Call once with confirmed=false (or omitted); if you "
+                "receive ACTION BLOCKED, ask the user out loud for confirmation. "
+                "Only set confirmed=true on a later turn after they explicitly say "
+                "yes. Prefer this only when they clearly ask to delete/remove a file."
             ),
             "parameters": {
                 "type": "object",
@@ -667,8 +810,33 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Absolute or user-relative path of the file to delete.",
                     },
+                    "confirmed": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Must only be set to True if the user has explicitly "
+                            "confirmed this action in the current or previous turn."
+                        ),
+                    },
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "undo_last_action",
+            "description": (
+                "Reverse the most recent deterministic filesystem action: "
+                "remove a folder created by create_folder, revert or delete a "
+                "file from write_file, or restore a file removed by delete_file. "
+                "Use when the user says undo, revert, or take that back. "
+                "Cannot undo searches, app launches, or clipboard tools."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
             },
         },
     },
@@ -676,12 +844,21 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 
 def execute_tool(name: str, arguments: dict[str, Any]) -> str:
-    """Look up a tool in the registry and run it."""
+    """Look up a tool in the registry and run it. Never raises to the caller."""
     fn = TOOL_REGISTRY.get(name)
     if fn is None:
-        return f"Unknown tool: {name}"
+        result = f"Unknown tool: {name}"
+        ui.report_tool_error(result)
+        return result
     ui.executing(name, arguments)
     ui.info(f"args={arguments}")
-    result = fn(**arguments)
+    try:
+        result = fn(**arguments)
+    except Exception as exc:  # noqa: BLE001
+        result = f"Error: {exc}"
     ui.info(result)
-    return result
+    if isinstance(result, str) and result.startswith("ACTION BLOCKED"):
+        return result
+    if ui.is_tool_error_result(str(result)):
+        ui.report_tool_error(str(result))
+    return str(result)

@@ -64,10 +64,19 @@ Tool selection guide:
         prior turns. Do not invent prompts; copy them from history.
 - read_file → read a text file from disk. Use when they ask to open, show,
   inspect, or summarize a file. You can chain: read_file then write_clipboard
-  or process the text in a later tool call.
-- delete_file → permanently delete a file. The app will pause for a y/n
-  confirmation in the terminal. Never call this for folders. Only when they
-  clearly ask to delete/remove a file.
+  or write_file.
+- write_file → create or overwrite a text file. Parent folder must already
+  exist. Example: "save this poem to notes.txt on my Desktop"
+      → write_file(path="C:\\\\Users\\\\…\\\\Desktop\\\\notes.txt", content="…")
+- delete_file → permanently delete a file. First call MUST use confirmed=false
+  (or omit it). If the tool returns ACTION BLOCKED, do NOT retry in the same
+  turn. Reply conversationally and ask for confirmation, e.g.
+  "Are you sure you want me to delete dummy.txt on your Desktop?"
+  On a later turn, if they say yes / proceed / confirm, call delete_file
+  again with confirmed=true. Never invent confirmation.
+- undo_last_action → reverse the last filesystem change (created folder,
+  written file, or deleted file). Use for "undo that", "revert", "take it back".
+  No arguments. Cannot undo searches, open_app, or clipboard tools.
 
 Rules:
 1. If the user asks to open/launch/start a desktop app → call open_app.
@@ -82,18 +91,23 @@ Rules:
    text. Never claim you copied something unless you called write_clipboard or
    process_clipboard in THIS turn.
 7. If the user asks to read/show/open a file on disk → call read_file.
-8. If the user asks to delete/remove a file → call delete_file (they must
-   confirm y/n in the terminal).
-9. You may call multiple tools, including chaining across rounds (read a file,
-   then write the summary to the clipboard, then confirm). Keep calling tools
-   until the task is actually done; only then reply with a short confirmation.
-10. Prefer tool calls over asking clarifying questions when the intent is clear.
-11. After tools run, briefly confirm what you did in plain language.
-12. If the request is not actionable with your tools, say so briefly.
-13. Prior turns are included. Lines starting with "[prior]" are historical
+8. If the user asks to save/write text to a file → call write_file.
+9. If the user asks to delete/remove a file → call delete_file with
+   confirmed=false first. If you get ACTION BLOCKED, ask them out loud
+   (no more tool calls this turn). After they say yes, call delete_file
+   with confirmed=true.
+10. If the user asks to undo/revert the last file or folder change → call
+    undo_last_action.
+11. You may call multiple tools, including chaining across rounds (read a file,
+    then write_file, then confirm). Keep calling tools until the task is
+    actually done; only then reply with a short confirmation.
+12. Prefer tool calls over asking clarifying questions when the intent is clear.
+13. After tools run, briefly confirm what you did in plain language.
+14. If the request is not actionable with your tools, say so briefly.
+15. Prior turns are included. Lines starting with "[prior]" are historical
     receipts. Lines starting with "[tool:" are raw results from tools already
-    run. Follow-ups like "do that again" or "put those on my clipboard" must
-    still call a tool this turn.
+    run. Follow-ups like "do that again" or "undo that" must still call a tool
+    this turn.
 """
 
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
@@ -272,6 +286,21 @@ class LLMOrchestrator:
             {"role": "assistant", "content": _clip_history_text(reply) or "(no reply)"}
         )
 
+    def _invoke_tool(self, name: str, args: dict[str, Any]) -> str:
+        """Run a registry tool; never raise. Errors go to the pill and back to the LLM."""
+        try:
+            result = execute_tool(name, args)
+        except Exception as exc:  # noqa: BLE001
+            result = f"Error: {exc}"
+            ui.report_tool_error(result)
+            return result
+        if isinstance(result, str) and result.startswith("ACTION BLOCKED"):
+            return result
+        if ui.is_tool_error_result(str(result)):
+            # execute_tool already painted the error pill; keep the string for the model.
+            return str(result)
+        return str(result)
+
     def _openai_completion_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"temperature": self.temperature}
         if self.provider == "ollama":
@@ -407,10 +436,10 @@ class LLMOrchestrator:
                 try:
                     args = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
-                    result = f"Invalid JSON arguments: {tc.function.arguments}"
-                    ui.error(result)
+                    result = f"Error: Invalid JSON arguments: {tc.function.arguments}"
+                    ui.report_tool_error(result)
                 else:
-                    result = execute_tool(tc.function.name, args)
+                    result = self._invoke_tool(tc.function.name, args)
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": result}
                 )
@@ -451,7 +480,7 @@ class LLMOrchestrator:
             tool_results = []
             for block in tool_uses:
                 args = block.input if isinstance(block.input, dict) else {}
-                result = execute_tool(block.name, args)
+                result = self._invoke_tool(block.name, args)
                 self._record_tool_result(block.name, result)
                 tool_results.append(
                     {

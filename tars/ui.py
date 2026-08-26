@@ -26,6 +26,8 @@ class PillState(str, Enum):
     IDLE = "idle"
     LISTENING = "listening"
     PROCESSING = "processing"
+    CONFIRMATION = "confirmation"
+    ERROR = "error"
     SUCCESS = "success"
 
 
@@ -42,16 +44,22 @@ class PillPayload:
 _pill: CommandPill | None = None
 _pill_lock = threading.Lock()
 _clipboard_ready = False
+_permission_pending = False
+_error_visible = False
 
 _DOT_IDLE = "#6B6B70"
 _DOT_LISTEN = "#E11D48"
 _DOT_PROCESS = "#F59E0B"
+_DOT_CONFIRM = "#F59E0B"
+_DOT_ERROR = "#EF4444"
 _DOT_SUCCESS = "#10B981"
 
 DRAWER_COLLAPSE_MS = 3000
+ERROR_HOLD_MS = 4000
 CLIPBOARD_READY_MS = 3500
 CLIPBOARD_PROCESSING_MESSAGE = "📋 Processing clipboard..."
 CLIPBOARD_READY_MESSAGE = "✅ Ready in clipboard! [Ctrl + V]"
+CONFIRMATION_MESSAGE = "⚠️ Awaiting Confirmation · Hold Ctrl+Space to reply"
 BAR_HEIGHT = 52
 DRAWER_HEIGHT = 118
 EXPANDED_HEIGHT = BAR_HEIGHT + DRAWER_HEIGHT
@@ -485,7 +493,7 @@ class CommandPill:
         state = payload.state
         self._stop_pulse()
 
-        if state != PillState.SUCCESS:
+        if state not in {PillState.SUCCESS, PillState.ERROR}:
             self._cancel_collapse()
 
         if state == PillState.IDLE:
@@ -512,6 +520,29 @@ class CommandPill:
                 self.status.configure(text=msg, text_color=FG)
             else:
                 self.status.configure(text=self._truncate(msg), text_color=FG)
+            return
+
+        if state == PillState.CONFIRMATION:
+            self._collapse_drawer()
+            self.shell.configure(border_color="#3F2E10")
+            self.dot.configure(text_color=_DOT_CONFIRM)
+            self.status.configure(
+                text=payload.message or CONFIRMATION_MESSAGE,
+                text_color=FG,
+            )
+            return
+
+        if state == PillState.ERROR:
+            self.shell.configure(border_color="#4C1515")
+            self.dot.configure(text_color=_DOT_ERROR)
+            short = payload.message or "❌ Error"
+            self.status.configure(text=short, text_color=FG)
+            full = payload.action or short
+            self.line_transcript.configure(text="❌  Error")
+            self.line_action.configure(text=self._truncate(full, 72))
+            self.line_latency.configure(text="⏱  Auto-clear in 4s")
+            self._expand_drawer()
+            self._schedule_collapse_to_idle(payload.collapse_ms or ERROR_HOLD_MS)
             return
 
         self.shell.configure(border_color="#0F3D2E")
@@ -545,6 +576,9 @@ def listening() -> None:
 
 
 def recording() -> None:
+    global _permission_pending, _error_visible
+    _permission_pending = False
+    _error_visible = False
     status("🔴 [RECORDING]", "Hold Ctrl+Space and speak…")
     set_state(PillState.LISTENING, "Listening…")
 
@@ -575,9 +609,53 @@ def executing_command() -> None:
 
 
 def awaiting_confirmation(detail: str = "") -> None:
-    """Amber pill while the CLI waits for y/n."""
+    """Amber pill: destructive tool is blocked pending a spoken yes/no."""
+    global _permission_pending
+    _permission_pending = True
     status("⚠️ [CONFIRM]", detail)
-    set_state(PillState.PROCESSING, "Waiting for confirmation…")
+    set_state(PillState.CONFIRMATION, CONFIRMATION_MESSAGE, action=detail or None)
+
+
+def error_tag(result: str) -> str:
+    """Map a tool/LLM error string to a short pill label."""
+    text = (result or "").lower()
+    if "not found" in text or "does not exist" in text or "no such" in text:
+        return "Path Not Found"
+    if "clipboard is empty" in text or "clipboard empty" in text:
+        return "Clipboard Empty"
+    if "invalid json" in text or "invalid parameter" in text or "empty" in text:
+        return "Invalid Parameters"
+    if "permission" in text or "refusing" in text or "declined" in text:
+        return "Not Allowed"
+    if "unknown tool" in text:
+        return "Unknown Tool"
+    return "Execution Failed"
+
+
+def is_tool_error_result(result: str) -> bool:
+    text = (result or "").strip()
+    if not text:
+        return False
+    if text.startswith("ACTION BLOCKED"):
+        return False
+    if text.startswith("Error:") or text.startswith("Failed ") or text.startswith("Failed to"):
+        return True
+    lowered = text.lower()
+    return lowered.startswith("clipboard is empty")
+
+
+def report_tool_error(result: str) -> None:
+    """Crimson error pill + drawer; auto-clears in 4s. Thread-safe via set_state."""
+    global _error_visible
+    _error_visible = True
+    tag = error_tag(result)
+    status("❌ [ERROR]", result)
+    set_state(
+        PillState.ERROR,
+        f"❌ Error: {tag}",
+        action=result.strip(),
+        collapse_ms=ERROR_HOLD_MS,
+    )
 
 
 def executing(tool_name: str, arguments: dict[str, Any] | None = None) -> None:
@@ -614,7 +692,10 @@ def success(
     transcript: str | None = None,
     action: str | None = None,
 ) -> None:
-    global _clipboard_ready
+    global _clipboard_ready, _permission_pending, _error_visible
+    if _permission_pending or _error_visible:
+        _clipboard_ready = False
+        return
     if _clipboard_ready:
         _clipboard_ready = False
         set_state(
@@ -650,8 +731,7 @@ def info(message: str) -> None:
 
 
 def error(message: str) -> None:
-    print(f"\n❌ [ERROR] {message}", flush=True)
-    set_state(PillState.PROCESSING, "Error")
+    report_tool_error(message)
 
 
 def transcript(text: str) -> None:
