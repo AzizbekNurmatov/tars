@@ -1,14 +1,12 @@
-"""Backward-compatible re-export of the tool registry."""
+"""Agent loop, permission sandbox, and tool registry."""
 
+from tars.core.agent import LLMOrchestrator, complete_isolated
 from tars.core.permissions import requires_confirmation
 from tars.core.registry import execute_tool, get_all_schemas, get_all_tools
 
-TOOL_REGISTRY = get_all_tools()
-TOOL_SCHEMAS = get_all_schemas()
-
 __all__ = [
-    "TOOL_REGISTRY",
-    "TOOL_SCHEMAS",
+    "LLMOrchestrator",
+    "complete_isolated",
     "execute_tool",
     "get_all_schemas",
     "get_all_tools",

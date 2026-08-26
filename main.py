@@ -21,10 +21,9 @@ import numpy as np
 from dotenv import load_dotenv
 
 from tars import ui
-from tars.audio import AudioRecorder
-from tars.hotkey import HOTKEY_LABEL, HotkeyListener
-from tars.llm import LLMOrchestrator
-from tars.transcribe import transcribe_audio, warmup_whisper
+from tars.audio.recorder import HOTKEY_LABEL, AudioRecorder, HotkeyListener
+from tars.audio.transcriber import transcribe_audio, warmup_whisper
+from tars.core.agent import LLMOrchestrator
 
 
 def _require_llm_config() -> str | None:

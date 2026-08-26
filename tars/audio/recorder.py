@@ -1,21 +1,26 @@
-"""Thread-safe push-to-talk microphone capture (in-memory only).
+"""Thread-safe push-to-talk microphone capture + Ctrl+Space hotkey.
 
-Hotkey press/release is handled by ``tars.hotkey``. This module returns a
-mono float32 NumPy buffer at 16 kHz — no disk I/O.
+Returns a mono float32 NumPy buffer at 16 kHz — no disk I/O. pynput callbacks
+only flip recording state; STT + LLM stay on a dedicated worker thread.
 """
 
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 
 import numpy as np
 import sounddevice as sd
+from pynput import keyboard
 
 from tars import ui
 
 SAMPLE_RATE = 16_000
 CHANNELS = 1
 DTYPE = "float32"
+
+HOTKEY_KEY = keyboard.Key.space
+HOTKEY_LABEL = "Ctrl+Space"
 
 
 class AudioRecorder:
@@ -44,7 +49,6 @@ class AudioRecorder:
             ui.error(f"Audio stream status: {status}")
         with self._lock:
             if self._recording:
-                # Copy — PortAudio reuses the buffer on the next callback.
                 self._chunks.append(indata.copy())
 
     def start(self) -> None:
@@ -94,7 +98,6 @@ class AudioRecorder:
             return None
 
         audio = np.concatenate(chunks, axis=0)
-        # Ensure shape (n,) float32 mono for faster-whisper
         if audio.ndim > 1:
             audio = audio.reshape(-1)
         audio = np.ascontiguousarray(audio, dtype=np.float32)
@@ -106,6 +109,83 @@ class AudioRecorder:
         ui.info(f"Captured {audio.size / self.sample_rate:.2f}s in-memory")
         return audio
 
-    # Back-compat alias if anything still calls the old name
     def stop_and_save(self, path=None) -> np.ndarray | None:  # noqa: ARG002
         return self.stop()
+
+
+class HotkeyListener:
+    """Press = start recording, release = stop + invoke ``on_release``."""
+
+    def __init__(
+        self,
+        on_press: Callable[[], None],
+        on_release: Callable[[], None],
+    ) -> None:
+        self._on_press = on_press
+        self._on_release = on_release
+        self._ctrl_down = False
+        self._combo_active = False
+        self._lock = threading.Lock()
+        self._listener: keyboard.Listener | None = None
+
+    def _is_ctrl(self, key: keyboard.Key | keyboard.KeyCode) -> bool:
+        return key in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r)
+
+    def _handle_press(self, key: keyboard.Key | keyboard.KeyCode) -> None:
+        with self._lock:
+            if self._is_ctrl(key):
+                self._ctrl_down = True
+                return
+
+            if key == HOTKEY_KEY and self._ctrl_down and not self._combo_active:
+                self._combo_active = True
+                should_start = True
+            else:
+                should_start = False
+
+        if should_start:
+            try:
+                self._on_press()
+            except Exception as exc:  # noqa: BLE001
+                ui.error(f"on_press failed: {exc}")
+
+    def _handle_release(self, key: keyboard.Key | keyboard.KeyCode) -> None:
+        with self._lock:
+            if self._is_ctrl(key):
+                self._ctrl_down = False
+                if self._combo_active:
+                    self._combo_active = False
+                    should_stop = True
+                else:
+                    should_stop = False
+            elif key == HOTKEY_KEY and self._combo_active:
+                self._combo_active = False
+                should_stop = True
+            else:
+                should_stop = False
+
+        if should_stop:
+            try:
+                self._on_release()
+            except Exception as exc:  # noqa: BLE001
+                ui.error(f"on_release failed: {exc}")
+
+    @property
+    def running(self) -> bool:
+        return self._listener is not None and self._listener.is_alive()
+
+    def start(self) -> None:
+        self._listener = keyboard.Listener(
+            on_press=self._handle_press,
+            on_release=self._handle_release,
+        )
+        self._listener.start()
+        ui.info(f"Hotkey armed: hold {HOTKEY_LABEL} to talk, release to process.")
+
+    def join(self) -> None:
+        if self._listener is not None:
+            self._listener.join()
+
+    def stop(self) -> None:
+        if self._listener is not None:
+            self._listener.stop()
