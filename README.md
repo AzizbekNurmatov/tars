@@ -1,6 +1,6 @@
 # TARS — Desktop Automation Assistant
 
-**TARS** is a Windows desktop AI assistant. You type or speak a command; an LLM turns it into a tool call; Python runs the action on your PC (open apps, create folders, search the web, transform or write the clipboard, snap Gemini into split-screen, and more). It keeps a short in-memory conversation window so follow-ups like “do that again” or “put my last prompts on the clipboard” work.
+**TARS** is a Windows desktop AI assistant. You type or speak a command; an LLM turns it into a tool call; Python runs the action on your PC (open apps, manage windows, create or undo files, search the web, transform or write the clipboard, and more). It keeps a short in-memory conversation window so follow-ups like “do that again” or “put my last prompts on the clipboard” work.
 
 Inspired by systems like JARVIS: one brain, many hands — text and voice share the same pipeline.
 
@@ -17,17 +17,15 @@ Inspired by systems like JARVIS: one brain, many hands — text and voice share 
              │  plain text string
              ▼
   ┌─────────────────────┐
-  │  LLMOrchestrator    │  Ollama / Anthropic / OpenAI
-  │  (tool calling +    │  last 5 turns kept in RAM
+  │  Agent loop         │  Ollama / Anthropic / OpenAI
+  │  (tool calling +    │  rolling RAM history
   │   rolling memory)   │
   └──────────┬──────────┘
              │  tool name + args
              ▼
   ┌─────────────────────┐
-  │  Tool registry      │  open_app, create_folder,
-  │                     │  search_web, open_url,
-  │                     │  process_clipboard,
-  │                     │  write_clipboard
+  │  Skill registry     │  system · windows · filesystem
+  │  (auto-discovered)  │  browser · clipboard
   └──────────┬──────────┘
              ▼
         Real OS action
@@ -56,45 +54,82 @@ Inspired by systems like JARVIS: one brain, many hands — text and voice share 
 
 ### Tools (what TARS can do)
 
+**System**
+
 | Tool | What it does | Example things you can say |
 |------|--------------|----------------------------|
 | `open_app` | Launch Windows apps (aliases for Notepad, Calc, VS Code, etc.) | “Open Notepad” · “Launch Calculator” |
+
+**Windows**
+
+| Tool | What it does | Example things you can say |
+|------|--------------|----------------------------|
+| `bring_to_front` | Restore and focus an already-open window | “Switch to Chrome” · “Bring VS Code to the front” |
+| `focus_zen_mode` | Maximize one app; minimize everything else | “Zen mode on VS Code” · “Focus mode, just Chrome” |
+| `tile_windows` | Snap two apps 50/50 (launches a missing app if needed) | “Split VS Code and Chrome” · “Tile Slack left and Edge right” |
+| `restore_workspace` | Named layouts: flutter/mobile, research/deep_work, reading | “Set up my flutter workspace” · “Research layout” · “Reading mode” |
+
+**Filesystem**
+
+| Tool | What it does | Example things you can say |
+|------|--------------|----------------------------|
 | `create_folder` | Create a folder on the Desktop | “Make a folder called Projects” |
+| `read_file` | Read a text file from disk | “Show me notes.txt on my Desktop” |
+| `write_file` | Create or overwrite a text file | “Save this poem to notes.txt on my Desktop” |
+| `delete_file` | Delete a file (voice confirmation required) | “Delete dummy.txt on my Desktop” — then “yes” |
+| `undo_last_action` | Reverse the last folder/file write or delete | “Undo that” · “Take it back” |
+
+**Browser**
+
+| Tool | What it does | Example things you can say |
+|------|--------------|----------------------------|
 | `search_web` | Search Google, YouTube, GitHub, Reddit, or **Gemini** | “Google pathlib” · “Search lo-fi on YouTube” |
 | `search_web` + `split_screen` | Snap current window left; open search on the right | “Search quantum computing on Gemini in split screen” |
 | `open_url` | Open a concrete URL / domain | “Open github.com” |
-| `process_clipboard` | Read copied text, transform it, write the result back | Copy a draft, then “Make this sound professional” · “Summarize this in 3 bullets” · “Translate to Spanish” |
+
+**Clipboard**
+
+| Tool | What it does | Example things you can say |
+|------|--------------|----------------------------|
+| `process_clipboard` | Read copied text, transform it, write the result back | Copy a draft, then “Make this sound professional” · “Summarize this in 3 bullets” |
 | `write_clipboard` | Generate **new** text and copy it (not a rewrite of what’s already copied) | “Write a short ocean poem and put it on my clipboard” · “Put my last three prompts on the clipboard” |
 
-**Clipboard vs write:** `process_clipboard` rewrites whatever you already copied. `write_clipboard` places brand-new content (a poem, recalled prompts, notes) so you can paste with **Ctrl+V**. Copied payloads stay off the conversation window — history only stores a tiny `[prior] used …` receipt so the model does not pretend a past tool call just happened.
+**Clipboard vs write:** `process_clipboard` rewrites whatever you already copied. `write_clipboard` places brand-new content (a poem, recalled prompts, notes) so you can paste with **Ctrl+V**. Copied payloads stay off the conversation window.
+
+**Destructive files:** `delete_file` always blocks on the first call (`ACTION BLOCKED`). The pill waits for a spoken yes, then a later turn may call it with `confirmed=true`. `undo_last_action` can restore that delete if it was the last filesystem change.
 
 ### Conversational memory
 
-The orchestrator keeps the last **5 user turns + 5 assistant receipts** in a RAM-only sliding window (`deque`, no disk). Isolated clipboard transforms do not pollute that window. Follow-ups such as “make it shorter”, “do that again”, or “give me my last prompts” resolve against those prior user messages.
+The agent keeps a rolling RAM-only window (`deque`, no disk) of recent user turns, assistant receipts, and tool results. Isolated clipboard transforms do not pollute that window. Follow-ups such as “make it shorter”, “do that again”, or “give me my last prompts” resolve against those prior user messages.
 
 ### Floating Command Pill UI (voice mode)
 
-Always-on-top, frameless, draggable pill at the bottom of the screen:
+Always-on-top, frameless, draggable pill at the bottom of the screen. Worker threads never touch Tk widgets — they enqueue updates for the GUI thread.
 
 | State | What you see |
 |-------|----------------|
 | **Idle** | Dark bar · “Hold Ctrl + Space” · provider tag · ✕ |
 | **Listening** | Crimson pulsing dot while you hold the hotkey |
 | **Processing** | Amber · live transcript / “Thinking…” / **📋 Processing clipboard...** |
-| **Success** | Emerald · expandable drawer with transcript, tool call, latency · auto-collapses after ~3s |
+| **Confirmation** | Amber · **⚠️ Awaiting Confirmation · Hold Ctrl+Space to reply** (destructive tools) |
+| **Reply** | Amber · **💬 Assistant asks... [Hold Ctrl+Space to reply]** · drawer shows the full question · holds ~6s |
+| **Success** | Emerald · drawer with transcript + assistant text (or tool call) + latency · auto-collapses after ~3s |
 | **Clipboard ready** | Emerald · **✅ Ready in clipboard! [Ctrl + V]** · holds 3.5s, then Idle |
+| **Error** | Crimson · short tag on the pill · full message in the drawer · auto-clears in 4s |
 
-- Native Windows 11 rounded corners (DWM)  
-- Drag by the bar; quit with **✕**, **Esc**, or **Ctrl+C**  
-- Terminal status lines still print (🔴 / ⚙️ / 🧠 / ✅)
+The pill always leaves **Thinking…**, even if the LLM path errors. Conversational replies (including clarifications that end in `?`) show on the compact bar and in the expanded drawer — you do not have to check the terminal.
+
+- Native Windows 11 rounded corners (DWM)
+- Drag by the bar; quit with **✕**, **Esc**, or **Ctrl+C**
+- Terminal status lines still print (🔴 / ⚙️ / 🧠 / ✅ / 💬)
 
 ### Latency / pipeline details
 
-- In-memory audio (no temp WAV on disk)  
-- Conversation history is RAM-only (no transcript files)  
-- Whisper model loaded once at startup (`base.en`, CPU/int8)  
-- Ollama `keep_alive` + temperature 0 for snappy tool calls  
-- Hotkey / STT / LLM on background threads; GUI never blocks them  
+- In-memory audio (no temp WAV on disk)
+- Conversation history is RAM-only (no transcript files)
+- Whisper model loaded once at startup (`base.en`, CPU/int8)
+- Ollama `keep_alive` + temperature 0 for snappy tool calls
+- Hotkey / STT / LLM on background threads; GUI never blocks them
 
 ---
 
@@ -102,19 +137,35 @@ Always-on-top, frameless, draggable pill at the bottom of the screen:
 
 ```text
 tars/
-├── main.py                 # Entrypoint: CLI loop or voice + pill UI
+├── main.py                      # Entrypoint: CLI loop or voice + pill UI
 ├── requirements.txt
-├── .env.example            # Safe template (commit this)
-├── .env                    # Your secrets (gitignored — never commit)
-├── README.md
+├── .env.example
+├── .env                         # gitignored
 └── tars/
-    ├── llm.py              # Provider switch + tool orchestration + RAM history
-    ├── tools.py            # Tool registry + schemas (incl. clipboard)
-    ├── ui.py               # Terminal logs + Command Pill overlay
-    ├── audio.py            # In-memory mic capture (sounddevice)
-    ├── hotkey.py           # Global Ctrl+Space (pynput)
-    └── transcribe.py       # faster-whisper singleton
+    ├── core/
+    │   ├── agent.py             # Multi-step tool loop + rolling memory
+    │   ├── permissions.py       # @requires_confirmation (spoken yes)
+    │   └── registry.py          # Discovers skills; get_all_tools / schemas
+    ├── skills/
+    │   ├── system/              # open_app
+    │   ├── windows/             # bring_to_front, zen, tile, workspaces
+    │   ├── filesystem/          # folders, read/write/delete, undo
+    │   ├── browser/             # search_web, open_url
+    │   └── clipboard/           # process_clipboard, write_clipboard
+    ├── providers/
+    │   ├── base.py              # LLMProvider ABC
+    │   ├── ollama.py
+    │   ├── openai.py
+    │   └── anthropic.py
+    ├── ui/pill.py               # CustomTkinter overlay + status helpers
+    └── audio/
+        ├── recorder.py          # Ctrl+Space hotkey + in-memory mic
+        └── transcriber.py       # faster-whisper singleton
 ```
+
+Each skill package exports `TOOLS` and `SCHEMAS`. The registry loads them with `pkgutil` — add a new folder under `skills/` and it is picked up automatically.
+
+`tars/llm.py`, `tars/tools.py`, `tars/hotkey.py`, and `tars/transcribe.py` are thin shims for older import paths.
 
 ---
 
@@ -129,6 +180,8 @@ python -m venv .venv
 pip install -r requirements.txt
 copy .env.example .env
 ```
+
+`pywin32` is required for window management (`bring_to_front`, zen mode, tiling, workspaces).
 
 ### 2. Configure `.env`
 
@@ -170,7 +223,7 @@ TARS_MODE=voice
 python main.py
 ```
 
-- **Voice:** hold Ctrl+Space → speak → release. Watch the pill + terminal.  
+- **Voice:** hold Ctrl+Space → speak → release. Watch the pill + terminal.
 - **CLI:** set `TARS_MODE=cli`, then type commands and `quit` to exit.
 
 ---
@@ -179,7 +232,15 @@ python main.py
 
 ```text
 open notepad
+switch to chrome
+zen mode on vs code
+split vs code and chrome
+set up my flutter workspace
+research layout
 create a folder called Demo
+save this to notes.txt on my Desktop
+delete dummy.txt on my Desktop
+undo that
 search YouTube for lo-fi beats
 open Gemini and search quantum computing
 search quantum computing on Gemini in split screen
@@ -208,6 +269,16 @@ Clipboard (copy text first, then speak):
 ✅ [EXECUTING] process_clipboard("Make this sound professional")
 📋 [CLIPBOARD] Processing clipboard...
 ✅ [CLIPBOARD] Ready in clipboard! [Ctrl + V]
+```
+
+Delete (first turn blocks; confirm on the next utterance):
+
+```text
+🗣️ [HEARD: "Delete dummy.txt on my Desktop"]
+⚠️ [CONFIRM]
+💬 [ASSISTANT] Are you sure you want me to delete dummy.txt…?
+🗣️ [HEARD: "Yes"]
+✅ [EXECUTING] delete_file(..., confirmed=true)
 ```
 
 ---
@@ -240,25 +311,25 @@ Clipboard (copy text first, then speak):
 | Speech-to-text | `faster-whisper` |
 | LLM | Ollama / Anthropic / OpenAI (tool calling) |
 | Clipboard | `pyperclip` |
-| Window snap | `PyGetWindow` |
+| Window snap / search split | `PyGetWindow` |
+| Window management | `pywin32` (`win32gui`, `win32con`, `win32process`) |
 | Overlay UI | `customtkinter` + Win11 DWM corners |
 
 ---
 
 ## Security notes
 
-- Never commit `.env` or paste API keys into source / README / `.env.example`.  
-- Tools can open apps and browsers, and can read/write the clipboard — treat the LLM as a privileged controller.  
-- Prefer confirming risky future tools (delete files, shell) before adding them.
+- Never commit `.env` or paste API keys into source / README / `.env.example`.
+- Tools can open apps and browsers, move windows, and read/write the clipboard — treat the LLM as a privileged controller.
+- `delete_file` is gated: first call returns `ACTION BLOCKED` until you speak an explicit yes on a later turn.
 
 ---
 
 ## Roadmap
 
-- More tools (files, volume, window management)  
-- Longer / optional persistent memory beyond the 5-turn RAM window  
-- Confirmation / allowlist for dangerous actions  
-- Packaging as a tray app  
+- Longer / optional persistent memory beyond the RAM window
+- Allowlist / extra confirmation for shell and other high-risk actions
+- Packaging as a tray app
 
 ---
 
