@@ -9,6 +9,7 @@ from tars.providers.base import (
     DEFAULT_ANTHROPIC_MAX_TOKENS,
     DEFAULT_ANTHROPIC_MODEL,
     DEFAULT_TRANSFORM_MAX_TOKENS,
+    DEFAULT_VISION_MAX_TOKENS,
     LLMProvider,
 )
 
@@ -78,6 +79,46 @@ class AnthropicProvider(LLMProvider):
             max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": user_text}],
+        )
+        return "".join(
+            block.text
+            for block in response.content
+            if getattr(block, "type", None) == "text"
+        ).strip()
+
+    def complete_vision(
+        self,
+        instruction: str,
+        b64_image: str,
+        *,
+        media_type: str = "image/jpeg",
+        max_tokens: int = DEFAULT_VISION_MAX_TOKENS,
+    ) -> str:
+        response = self._client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64_image,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Instruction: {instruction}\n"
+                                "Analyze this screen snip accurately and concisely."
+                            ),
+                        },
+                    ],
+                }
+            ],
         )
         return "".join(
             block.text

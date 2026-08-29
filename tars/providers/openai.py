@@ -11,6 +11,7 @@ from tars.providers.base import (
     DEFAULT_OPENAI_MODEL,
     DEFAULT_TEMPERATURE,
     DEFAULT_TRANSFORM_MAX_TOKENS,
+    DEFAULT_VISION_MAX_TOKENS,
     LLMProvider,
 )
 
@@ -88,6 +89,35 @@ class OpenAIProvider(LLMProvider):
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_text},
+            ],
+            max_tokens=max_tokens,
+            **self.extra_chat_kwargs(),
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    def complete_vision(
+        self,
+        instruction: str,
+        b64_image: str,
+        *,
+        media_type: str = "image/jpeg",
+        max_tokens: int = DEFAULT_VISION_MAX_TOKENS,
+    ) -> str:
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": instruction},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{b64_image}"
+                            },
+                        },
+                    ],
+                }
             ],
             max_tokens=max_tokens,
             **self.extra_chat_kwargs(),

@@ -25,6 +25,7 @@ _SCHEMA_ORDER = (
     "open_url",
     "process_clipboard",
     "write_clipboard",
+    "analyze_screen_snippet",
     "read_file",
     "write_file",
     "delete_file",

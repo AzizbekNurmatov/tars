@@ -8,6 +8,7 @@ from tars.providers.base import (
     DEFAULT_TRANSFORM_MAX_TOKENS,
     LLMProvider,
     complete_isolated,
+    complete_vision_isolated,
     get_active_provider,
     set_active_provider,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "DEFAULT_TRANSFORM_MAX_TOKENS",
     "LLMProvider",
     "complete_isolated",
+    "complete_vision_isolated",
     "create_provider",
     "get_active_provider",
     "set_active_provider",

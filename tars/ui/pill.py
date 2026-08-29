@@ -699,6 +699,8 @@ def awaiting_confirmation(detail: str = "") -> None:
 def error_tag(result: str) -> str:
     """Map a tool/LLM error string to a short pill label."""
     text = (result or "").lower()
+    if "no image found" in text or "no screenshot" in text:
+        return "No image found on clipboard"
     if "not found" in text or "does not exist" in text or "no such" in text:
         return "Path Not Found"
     if "clipboard is empty" in text or "clipboard empty" in text:
@@ -743,6 +745,9 @@ def executing(tool_name: str, arguments: dict[str, Any] | None = None) -> None:
     status("✅ [EXECUTING]", call)
     if tool_name in {"process_clipboard", "write_clipboard"}:
         processing_clipboard(action=call)
+        return
+    if tool_name == "analyze_screen_snippet":
+        set_state(PillState.PROCESSING, "Analyzing screenshot…", action=call)
         return
     set_state(PillState.PROCESSING, call, action=call)
 

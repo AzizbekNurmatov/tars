@@ -13,6 +13,7 @@ DEFAULT_KEEP_ALIVE = "5m"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_ANTHROPIC_MAX_TOKENS = 1024
 DEFAULT_TRANSFORM_MAX_TOKENS = 8192
+DEFAULT_VISION_MAX_TOKENS = 2048
 
 _active_provider: LLMProvider | None = None
 
@@ -66,6 +67,17 @@ class LLMProvider(ABC):
         """Convert OpenAI-style schemas to this provider's tool format."""
         return openai_schemas
 
+    def complete_vision(
+        self,
+        instruction: str,
+        b64_image: str,
+        *,
+        media_type: str = "image/jpeg",
+        max_tokens: int = DEFAULT_VISION_MAX_TOKENS,
+    ) -> str:
+        """Isolated multimodal completion (no tool calling). Image is JPEG/PNG base64."""
+        raise NotImplementedError(f"{self.name} does not support vision")
+
 
 def set_active_provider(provider: LLMProvider) -> None:
     global _active_provider
@@ -90,3 +102,25 @@ def complete_isolated(
         provider = create_provider()
         set_active_provider(provider)
     return provider.complete(user_text, system=system, max_tokens=max_tokens)
+
+
+def complete_vision_isolated(
+    instruction: str,
+    b64_image: str,
+    *,
+    media_type: str = "image/jpeg",
+    max_tokens: int = DEFAULT_VISION_MAX_TOKENS,
+) -> str:
+    """Run a no-tools vision completion on the active (or a newly built) provider."""
+    provider = _active_provider
+    if provider is None:
+        from tars.providers import create_provider
+
+        provider = create_provider()
+        set_active_provider(provider)
+    return provider.complete_vision(
+        instruction,
+        b64_image,
+        media_type=media_type,
+        max_tokens=max_tokens,
+    )
