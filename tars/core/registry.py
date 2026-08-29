@@ -30,6 +30,7 @@ _SCHEMA_ORDER = (
     "write_file",
     "delete_file",
     "undo_last_action",
+    "execute_command",
 )
 
 _TOOLS: dict[str, Callable[..., str]] | None = None
