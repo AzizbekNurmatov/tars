@@ -16,6 +16,7 @@ from tars import ui
 # Match the historical TOOL_SCHEMAS order so the model sees the same catalog.
 _SCHEMA_ORDER = (
     "open_app",
+    "inspect_system",
     "bring_to_front",
     "focus_zen_mode",
     "tile_windows",
@@ -31,6 +32,8 @@ _SCHEMA_ORDER = (
     "delete_file",
     "undo_last_action",
     "execute_command",
+    "list_macros",
+    "run_macro",
 )
 
 _TOOLS: dict[str, Callable[..., str]] | None = None

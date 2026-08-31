@@ -752,6 +752,9 @@ def executing(tool_name: str, arguments: dict[str, Any] | None = None) -> None:
     if tool_name == "execute_command":
         set_state(PillState.PROCESSING, "Running command…", action=call)
         return
+    if tool_name == "run_macro":
+        set_state(PillState.PROCESSING, "Running macro…", action=call)
+        return
     set_state(PillState.PROCESSING, call, action=call)
 
 

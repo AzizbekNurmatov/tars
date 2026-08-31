@@ -11,3 +11,4 @@ PyGetWindow>=0.0.9
 pyperclip>=1.8.2
 pywin32>=306
 Pillow>=10.0.0
+PyYAML>=6.0.1

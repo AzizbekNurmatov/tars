@@ -1,0 +1,16 @@
+clean_desk:
+  description: "Minimizes distracting background windows and focuses the primary editor."
+  steps:
+    - tool: "focus_zen_mode"
+      args:
+        target_app: "Visual Studio Code"
+
+morning_prep:
+  description: "Runs system diagnostics and checks current git status."
+  steps:
+    - tool: "inspect_system"
+      args:
+        query_type: "summary"
+    - tool: "execute_command"
+      args:
+        command: "git status"
