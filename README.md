@@ -1,6 +1,6 @@
 # TARS — Desktop Automation Assistant
 
-**TARS** is a Windows desktop AI assistant. You type or speak a command; an LLM turns it into a tool call; Python runs the action on your PC (open apps, manage windows, create or undo files, search the web, transform or write the clipboard, and more). It keeps a short in-memory conversation window so follow-ups like “do that again” or “put my last prompts on the clipboard” work.
+**TARS** is a Windows desktop AI assistant. You type or speak a command; an LLM turns it into a tool call; Python runs the action on your PC (open apps, manage windows, create or undo files, search the web, transform or write the clipboard, inspect a screen snip, run a silent shell command, fire a named macro, and more). It keeps a short in-memory conversation window so follow-ups like “do that again” or “put my last prompts on the clipboard” work.
 
 Inspired by systems like JARVIS: one brain, many hands — text and voice share the same pipeline.
 
@@ -25,7 +25,8 @@ Inspired by systems like JARVIS: one brain, many hands — text and voice share 
              ▼
   ┌─────────────────────┐
   │  Skill registry     │  system · windows · filesystem
-  │  (auto-discovered)  │  browser · clipboard
+  │  (auto-discovered)  │  browser · clipboard · vision
+  │                     │  terminal · macros
   └──────────┬──────────┘
              ▼
         Real OS action
@@ -48,9 +49,9 @@ Inspired by systems like JARVIS: one brain, many hands — text and voice share 
 
 | Provider | When to use | Env |
 |----------|-------------|-----|
-| **Ollama** | Free / local / offline | `LLM_PROVIDER=ollama` |
-| **Anthropic** | Claude cloud quality | `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` |
-| **OpenAI** | GPT tool calling | `LLM_PROVIDER=openai` + `OPENAI_API_KEY` |
+| **Ollama** | Free / local / offline (text tools; not screen snips unless you run a vision model) | `LLM_PROVIDER=ollama` |
+| **Anthropic** | Claude cloud quality + vision | `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` |
+| **OpenAI** | GPT tool calling + vision (`gpt-4o` / `gpt-4o-mini`) | `LLM_PROVIDER=openai` + `OPENAI_API_KEY` |
 
 ### Tools (what TARS can do)
 
@@ -59,6 +60,7 @@ Inspired by systems like JARVIS: one brain, many hands — text and voice share 
 | Tool | What it does | Example things you can say |
 |------|--------------|----------------------------|
 | `open_app` | Launch Windows apps (aliases for Notepad, Calc, VS Code, etc.) | “Open Notepad” · “Launch Calculator” |
+| `inspect_system` | Read-only snapshot: hostname, OS, CPU, RAM, disk free | “How much RAM do I have?” · “System status” |
 
 **Windows**
 
@@ -96,11 +98,34 @@ Inspired by systems like JARVIS: one brain, many hands — text and voice share 
 
 **Clipboard vs write:** `process_clipboard` rewrites whatever you already copied. `write_clipboard` places brand-new content (a poem, recalled prompts, notes) so you can paste with **Ctrl+V**. Copied payloads stay off the conversation window.
 
-**Destructive files:** `delete_file` always blocks on the first call (`ACTION BLOCKED`). The pill waits for a spoken yes, then a later turn may call it with `confirmed=true`. `undo_last_action` can restore that delete if it was the last filesystem change.
+**Vision**
+
+| Tool | What it does | Example things you can say |
+|------|--------------|----------------------------|
+| `analyze_screen_snippet` | Inspect the screenshot currently on the clipboard (Win+Shift+S / PrtScn). Image stays in RAM — no disk write. | Snip first, then “Explain this error” · “Extract this code” · “Summarize this chart” |
+
+Vision needs a multimodal model (`claude-sonnet-4-5`, `gpt-4o` / `gpt-4o-mini`). The default Ollama text model cannot see images. If the clipboard has no bitmap, the tool returns a validation error and the pill shows **❌ Error: No image found on clipboard.**
+
+**Terminal**
+
+| Tool | What it does | Example things you can say |
+|------|--------------|----------------------------|
+| `execute_command` | Run a PowerShell/CMD command with no visible window; return stdout/stderr (capped at 1,200 characters) | “What’s my IP?” · “Git status” · “List running processes” |
+
+**Macros**
+
+| Tool | What it does | Example things you can say |
+|------|--------------|----------------------------|
+| `list_macros` | List named workflows in `macros.yaml` (re-read from disk every call) | “What macros do I have?” |
+| `run_macro` | Run a static sequence of existing tools. No variable substitution. | “Clean desk” · “Morning prep” |
+
+Paste or edit recipes in `tars/skills/macros/macros.yaml`. The next voice turn picks them up — no app restart. Baseline presets: **clean_desk** (zen mode on VS Code) and **morning_prep** (system summary + `git status`).
+
+**Destructive files & shell:** `delete_file` always blocks on the first call (`ACTION BLOCKED`). High-risk terminal tokens (`rmdir`, `del /`, `taskkill /f`, disk `format`, `Remove-Item`, `shutdown`, …) use the same spoken-yes sandbox: first call blocks, the pill waits, then a later turn may retry with `confirmed=true`. `undo_last_action` can restore a delete if it was the last filesystem change. Macros do not skip that gate — if a step blocks, confirm the inner tool; do not invent `confirmed=true`.
 
 ### Conversational memory
 
-The agent keeps a rolling RAM-only window (`deque`, no disk) of recent user turns, assistant receipts, and tool results. Isolated clipboard transforms do not pollute that window. Follow-ups such as “make it shorter”, “do that again”, or “give me my last prompts” resolve against those prior user messages.
+The agent keeps a rolling RAM-only window (`deque`, no disk) of recent user turns, assistant receipts, and tool results. Isolated clipboard transforms and vision calls send the image/text payload off to the model separately — only the resulting **text** lands in history. Follow-ups such as “make it shorter”, “do that again”, or “give me my last prompts” resolve against those prior user messages.
 
 ### Floating Command Pill UI (voice mode)
 
@@ -110,7 +135,7 @@ Always-on-top, frameless, draggable pill at the bottom of the screen. Worker thr
 |-------|----------------|
 | **Idle** | Dark bar · “Hold Ctrl + Space” · provider tag · ✕ |
 | **Listening** | Crimson pulsing dot while you hold the hotkey |
-| **Processing** | Amber · live transcript / “Thinking…” / **📋 Processing clipboard...** |
+| **Processing** | Amber · live transcript / “Thinking…” / **📋 Processing clipboard...** / **Analyzing screenshot…** / **Running command…** / **Running macro…** |
 | **Confirmation** | Amber · **⚠️ Awaiting Confirmation · Hold Ctrl+Space to reply** (destructive tools) |
 | **Reply** | Amber · **💬 Assistant asks... [Hold Ctrl+Space to reply]** · drawer shows the full question · holds ~6s |
 | **Success** | Emerald · drawer with transcript + assistant text (or tool call) + latency · auto-collapses after ~3s |
@@ -127,9 +152,10 @@ The pill always leaves **Thinking…**, even if the LLM path errors. Conversatio
 
 - In-memory audio (no temp WAV on disk)
 - Conversation history is RAM-only (no transcript files)
+- Screen snips are grabbed from the clipboard bitmap and JPEG-encoded in RAM (no screenshot files)
 - Whisper model loaded once at startup (`base.en`, CPU/int8)
 - Ollama `keep_alive` + temperature 0 for snappy tool calls
-- Hotkey / STT / LLM on background threads; GUI never blocks them
+- Hotkey / STT / LLM / macro chains on background threads; GUI never blocks them
 
 ---
 
@@ -147,11 +173,14 @@ tars/
     │   ├── permissions.py       # @requires_confirmation (spoken yes)
     │   └── registry.py          # Discovers skills; get_all_tools / schemas
     ├── skills/
-    │   ├── system/              # open_app
+    │   ├── system/              # open_app, inspect_system
     │   ├── windows/             # bring_to_front, zen, tile, workspaces
     │   ├── filesystem/          # folders, read/write/delete, undo
     │   ├── browser/             # search_web, open_url
-    │   └── clipboard/           # process_clipboard, write_clipboard
+    │   ├── clipboard/           # process_clipboard, write_clipboard
+    │   ├── vision/              # analyze_screen_snippet (clipboard image)
+    │   ├── terminal/            # execute_command (hidden window)
+    │   └── macros/              # list_macros, run_macro + macros.yaml
     ├── providers/
     │   ├── base.py              # LLMProvider ABC
     │   ├── ollama.py
@@ -181,7 +210,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-`pywin32` is required for window management (`bring_to_front`, zen mode, tiling, workspaces).
+`pywin32` is required for window management (`bring_to_front`, zen mode, tiling, workspaces). `Pillow` is required for screen-snip vision. `PyYAML` is required for macros.
 
 ### 2. Configure `.env`
 
@@ -199,7 +228,7 @@ WHISPER_MODEL=base.en
 
 Start Ollama first: `ollama serve` (and have the model pulled).
 
-**Anthropic:**
+**Anthropic (recommended for vision):**
 
 ```env
 LLM_PROVIDER=anthropic
@@ -249,6 +278,13 @@ make this sound professional
 summarize this in 3 bullets
 write a short poem about the ocean and put it on my clipboard
 put my last three prompts on the clipboard
+explain this error
+extract the code from this snip and put it on my clipboard
+what's my IP
+git status
+clean desk
+morning prep
+what macros do I have
 ```
 
 Typical terminal flow:
@@ -279,6 +315,34 @@ Delete (first turn blocks; confirm on the next utterance):
 💬 [ASSISTANT] Are you sure you want me to delete dummy.txt…?
 🗣️ [HEARD: "Yes"]
 ✅ [EXECUTING] delete_file(..., confirmed=true)
+```
+
+Vision (Win+Shift+S first, then speak):
+
+```text
+🗣️ [HEARD: "Explain this error"]
+✅ [EXECUTING] analyze_screen_snippet("Explain this error")
+```
+
+If nothing is on the clipboard as an image:
+
+```text
+❌ [ERROR] Error: No image found on the clipboard. Use Win+Shift+S or PrtScn to snip an area first.
+```
+
+Silent shell:
+
+```text
+🗣️ [HEARD: "What's my IP"]
+✅ [EXECUTING] execute_command("ipconfig")
+```
+
+Macro:
+
+```text
+🗣️ [HEARD: "Clean desk"]
+✅ [EXECUTING] run_macro("clean_desk")
+✅ [EXECUTING] focus_zen_mode("Visual Studio Code")
 ```
 
 ---
@@ -314,21 +378,24 @@ Delete (first turn blocks; confirm on the next utterance):
 | Window snap / search split | `PyGetWindow` |
 | Window management | `pywin32` (`win32gui`, `win32con`, `win32process`) |
 | Overlay UI | `customtkinter` + Win11 DWM corners |
+| Screen snips | `Pillow` (`ImageGrab` clipboard bitmap → JPEG in RAM) |
+| Macros | `PyYAML` (`macros.yaml`, hot-reloaded on each call) |
 
 ---
 
 ## Security notes
 
 - Never commit `.env` or paste API keys into source / README / `.env.example`.
-- Tools can open apps and browsers, move windows, and read/write the clipboard — treat the LLM as a privileged controller.
+- Tools can open apps and browsers, move windows, read/write the clipboard, and run shell commands — treat the LLM as a privileged controller.
 - `delete_file` is gated: first call returns `ACTION BLOCKED` until you speak an explicit yes on a later turn.
+- `execute_command` is gated the same way when the command looks destructive. Benign commands (`ipconfig`, `git status`) run immediately, hidden (`CREATE_NO_WINDOW`).
+- `analyze_screen_snippet` only reads the clipboard bitmap in RAM; it never writes a screenshot file.
 
 ---
 
 ## Roadmap
 
 - Longer / optional persistent memory beyond the RAM window
-- Allowlist / extra confirmation for shell and other high-risk actions
 - Packaging as a tray app
 
 ---
