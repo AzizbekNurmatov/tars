@@ -60,6 +60,7 @@ DRAWER_COLLAPSE_MS = 3000
 ERROR_HOLD_MS = 4000
 CLIPBOARD_READY_MS = 3500
 REPLY_HOLD_MS = 6000
+REMINDER_HOLD_MS = 6000
 CLIPBOARD_PROCESSING_MESSAGE = "📋 Processing clipboard..."
 CLIPBOARD_READY_MESSAGE = "✅ Ready in clipboard! [Ctrl + V]"
 CONFIRMATION_MESSAGE = "⚠️ Awaiting Confirmation · Hold Ctrl+Space to reply"
@@ -755,6 +756,9 @@ def executing(tool_name: str, arguments: dict[str, Any] | None = None) -> None:
     if tool_name == "run_macro":
         set_state(PillState.PROCESSING, "Running macro…", action=call)
         return
+    if tool_name == "schedule_task":
+        set_state(PillState.PROCESSING, "Scheduling…", action=call)
+        return
     set_state(PillState.PROCESSING, call, action=call)
 
 
@@ -773,6 +777,20 @@ def clipboard_ready() -> None:
         PillState.SUCCESS,
         CLIPBOARD_READY_MESSAGE,
         collapse_ms=CLIPBOARD_READY_MS,
+    )
+
+
+def reminder(message: str) -> None:
+    """Timer-fired banner. Thread-safe via set_state → root.after() poller."""
+    text = (message or "").strip() or "Reminder"
+    status("⏰ [REMINDER]", text)
+    if _permission_pending:
+        return
+    set_state(
+        PillState.SUCCESS,
+        f"⏰ {preview_words(text)}",
+        reply=text,
+        collapse_ms=REMINDER_HOLD_MS,
     )
 
 

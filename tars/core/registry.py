@@ -34,6 +34,8 @@ _SCHEMA_ORDER = (
     "execute_command",
     "list_macros",
     "run_macro",
+    "schedule_task",
+    "list_scheduled_tasks",
 )
 
 _TOOLS: dict[str, Callable[..., str]] | None = None

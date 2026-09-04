@@ -24,6 +24,7 @@ from tars import ui
 from tars.audio.recorder import HOTKEY_LABEL, AudioRecorder, HotkeyListener
 from tars.audio.transcriber import transcribe_audio, warmup_whisper
 from tars.core.agent import LLMOrchestrator
+from tars.skills.scheduler.handlers import start_scheduler
 
 
 def _require_llm_config() -> str | None:
@@ -232,6 +233,7 @@ def main() -> int:
         return 1
 
     llm = LLMOrchestrator()
+    start_scheduler()
 
     mode = os.getenv("TARS_MODE", "cli").lower().strip()
     if mode in {"voice", "ptt", "push-to-talk"}:
